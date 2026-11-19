@@ -74,6 +74,10 @@ pub enum Event {
     Failed { id: u64, error: String },
     Cleared,
     Level { level: f32, threshold: f32, speaking: bool },
+    /// 一句话因为一直连不上转写服务而丢掉。`ms` 是这句的时长。
+    Lost { ms: u64 },
+    /// 麦克风或输出设备断开，这次运行已经不能工作，需要重新打开设备。
+    DeviceLost { message: String },
     Error { message: String },
 }
 
@@ -90,8 +94,8 @@ impl Pipeline {
     /// 需要在 tokio 运行时里调用。`held` 是按键说话的按键状态。
     pub fn start(net: Net, cfg: Config, held: Arc<AtomicBool>, events: mpsc::UnboundedSender<Event>) -> Result<Self> {
         let err_tx = events.clone();
-        let on_error = move |m: String| {
-            let _ = err_tx.send(Event::Error { message: m });
+        let on_error = move |e: audio::StreamError| {
+            let _ = err_tx.send(if e.lost { Event::DeviceLost { message: e.message } } else { Event::Error { message: e.message } });
         };
         let open = |s: &Sink| -> Result<Output> {
             match s {
@@ -100,7 +104,16 @@ impl Pipeline {
             }
         };
         let live = open(&cfg.output)?;
-        let monitor = cfg.monitor.as_ref().map(open).transpose()?;
+        // 监听只是给主播自己听的：打不开（耳机没插）不影响直播，先不监听
+        // 提示在 Started 之后发：界面收到 Started 之前不认这次运行的事件
+        let mut warning = None;
+        let monitor = cfg.monitor.as_ref().and_then(|m| match open(m) {
+            Ok(o) => Some(o),
+            Err(e) => {
+                warning = Some(format!("监听设备打不开，先不监听：{e:#}"));
+                None
+            }
+        });
         let (out_name, mon_name) = (live.name.clone(), monitor.as_ref().map(|m| m.name.clone()));
         let monitor_volume = monitor.as_ref().map(Output::volume);
         let echo = monitor.as_ref().filter(|_| cfg.echo_gate).map(Output::activity);
@@ -108,40 +121,7 @@ impl Pipeline {
             v.set(cfg.monitor_volume);
         }
 
-        // 朗读队列
-        let (qtx, mut qrx) = mpsc::unbounded_channel();
-        let queue = SpeechQueue::start(net.clone(), cfg.voice.clone(), live, monitor, qtx);
-        let ev = events.clone();
-        tokio::spawn(async move {
-            while let Some(e) = qrx.recv().await {
-                let _ = ev.send(match e {
-                    QueueEvent::Added { id, text } => Event::Added { id, text },
-                    QueueEvent::Playing { id, text } => Event::Playing { id, text },
-                    QueueEvent::Done { id, stall_ms } => Event::Done { id, stall_ms },
-                    QueueEvent::Failed { id, error } => Event::Failed { id, error },
-                    QueueEvent::Cleared => Event::Cleared,
-                });
-            }
-        });
-
-        // 转写：定稿直接进朗读队列
-        let (stx, mut srx) = mpsc::unbounded_channel();
-        let transcriber = Transcriber::start(net, cfg.vocabulary.clone(), stx);
-        let (ev, q) = (events.clone(), queue.clone());
-        tokio::spawn(async move {
-            while let Some(e) = srx.recv().await {
-                let _ = ev.send(match e {
-                    SttEvent::Connected => Event::SttConnected,
-                    SttEvent::Disconnected(reason) => Event::SttDisconnected { reason },
-                    SttEvent::Interim(text) => Event::Interim { text },
-                    SttEvent::Final(text) => {
-                        q.say(text.clone());
-                        Event::Final { text }
-                    }
-                });
-            }
-        });
-
+        // 先打开所有设备，再连转写服务（按连接时长计费）：设备打不开时不白连一次
         // 输入：声卡回调或 WAV 线程把音频交给处理线程
         let stop = Arc::new(AtomicBool::new(false));
         let (atx, arx) = std_mpsc::channel::<Vec<f32>>();
@@ -178,6 +158,42 @@ impl Pipeline {
             }
         };
         drop(atx);
+
+        // 朗读队列
+        let (qtx, mut qrx) = mpsc::unbounded_channel();
+        let queue = SpeechQueue::start(net.clone(), cfg.voice.clone(), live, monitor, qtx);
+        let ev = events.clone();
+        tokio::spawn(async move {
+            while let Some(e) = qrx.recv().await {
+                let _ = ev.send(match e {
+                    QueueEvent::Added { id, text } => Event::Added { id, text },
+                    QueueEvent::Playing { id, text } => Event::Playing { id, text },
+                    QueueEvent::Done { id, stall_ms } => Event::Done { id, stall_ms },
+                    QueueEvent::Failed { id, error } => Event::Failed { id, error },
+                    QueueEvent::Cleared => Event::Cleared,
+                });
+            }
+        });
+
+        // 转写：定稿直接进朗读队列
+        let (stx, mut srx) = mpsc::unbounded_channel();
+        let transcriber = Transcriber::start(net, cfg.vocabulary.clone(), stx);
+        let (ev, q) = (events.clone(), queue.clone());
+        tokio::spawn(async move {
+            while let Some(e) = srx.recv().await {
+                let _ = ev.send(match e {
+                    SttEvent::Connected => Event::SttConnected,
+                    SttEvent::Disconnected(reason) => Event::SttDisconnected { reason },
+                    SttEvent::Interim(text) => Event::Interim { text },
+                    SttEvent::Lost(ms) => Event::Lost { ms },
+                    SttEvent::Final(text) => {
+                        q.say(text.clone());
+                        Event::Final { text }
+                    }
+                });
+            }
+        });
+
 
         let mut ep = Endpointer::new(cfg.mode, cfg.gate_ms, cfg.max_ms);
         let (stop2, ev, q) = (stop.clone(), events.clone(), queue.clone());
@@ -225,7 +241,7 @@ impl Pipeline {
                         q.warm();
                     }
                     frames += 1;
-                    if frames % 3 == 0 {
+                    if frames.is_multiple_of(3) {
                         let _ = ev.send(Event::Level { level, threshold: ep.threshold(), speaking: ep.speaking() });
                     }
                 }
@@ -234,6 +250,9 @@ impl Pipeline {
         })?;
 
         let _ = events.send(Event::Started { input: in_name, output: out_name, monitor: mon_name });
+        if let Some(message) = warning {
+            let _ = events.send(Event::Error { message });
+        }
         Ok(Self { queue, monitor_volume, stop, worker: Some(worker), wav_feeder, _capture: capture })
     }
 

@@ -34,6 +34,8 @@ const KEY_FILE: &str = "fish-api-key";
 const PREVIEW_TEXT: &str = "大家好，这是现在选中的声音。";
 /// 一句播完后，字幕再留这么久。
 const LINGER: std::time::Duration = std::time::Duration::from_millis(1500);
+/// 运行中多久检查一次设备：设备断开、或用“系统默认”时默认设备换了，就重新打开。
+const DEVICE_CHECK: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -103,6 +105,14 @@ struct AppState {
     path: PathBuf,
     settings: Mutex<Settings>,
     pipeline: Mutex<Option<Pipeline>>,
+    /// 用户点了开始、还没点停止。设备断开导致链路停了也保持为真，设备回来后自动重开。
+    want: AtomicBool,
+    /// 当前这次运行的麦克风或输出设备报告断开。
+    device_lost: AtomicBool,
+    /// 这次运行开始时的系统默认（麦克风, 输出）。
+    defaults: Mutex<(String, String)>,
+    /// 想运行但打不开设备时的原因。
+    waiting: Mutex<Option<String>>,
     /// 每次开始加一。换设置重启时，上一次的事件可能晚到，界面和字幕页只认当前这次。
     run: AtomicU64,
     held: Arc<AtomicBool>,
@@ -120,6 +130,8 @@ struct Snapshot {
     settings: Settings,
     key_source: Option<&'static str>,
     running: bool,
+    want: bool,
+    waiting: Option<String>,
     overlay_url: Option<String>,
     overlay_error: Option<String>,
     hotkey_error: Option<String>,
@@ -134,6 +146,8 @@ fn snapshot_of(s: &AppState) -> Snapshot {
         settings: s.settings.lock().unwrap().clone(),
         key_source: s.key.lock().unwrap().as_ref().map(|(_, src)| *src),
         running: s.pipeline.lock().unwrap().is_some(),
+        want: s.want.load(Ordering::Acquire),
+        waiting: s.waiting.lock().unwrap().clone(),
         overlay_url: s.overlay.lock().unwrap().as_ref().map(Overlay::url),
         overlay_error: s.overlay_error.lock().unwrap().clone(),
         hotkey_error: s.hotkey_error.lock().unwrap().clone(),
@@ -171,13 +185,13 @@ fn load_key(path: &std::path::Path, from_keychain: bool) -> Option<(String, &'st
             return Some((k.to_string(), "saved"));
         }
     }
-    if let Some(entry) = keyring::Entry::new(KEY_SERVICE, KEY_ACCOUNT).ok().filter(|_| from_keychain) {
-        if let Ok(k) = entry.get_password() {
-            let k = k.trim().to_string();
-            if !k.is_empty() && write_key(path, &k).is_ok() {
-                let _ = entry.delete_credential();
-                return Some((k, "saved"));
-            }
+    if let Some(entry) = keyring::Entry::new(KEY_SERVICE, KEY_ACCOUNT).ok().filter(|_| from_keychain)
+        && let Ok(k) = entry.get_password()
+    {
+        let k = k.trim().to_string();
+        if !k.is_empty() && write_key(path, &k).is_ok() {
+            let _ = entry.delete_credential();
+            return Some((k, "saved"));
         }
     }
     env_key()
@@ -256,9 +270,13 @@ fn start_pipeline(app: &AppHandle) -> Result<(), String> {
             echo_gate: st.echo_gate,
         }
     };
+    let defaults = (audio::default_id(true), audio::default_id(false));
     let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
     let pipeline = Pipeline::start(net, cfg, s.held.clone(), tx).map_err(|e| format!("{e:#}"))?;
     let run = s.run.fetch_add(1, Ordering::AcqRel) + 1;
+    s.device_lost.store(false, Ordering::Release);
+    *s.defaults.lock().unwrap() = defaults;
+    *s.waiting.lock().unwrap() = None;
     *s.pipeline.lock().unwrap() = Some(pipeline);
 
     // 事件：字幕页跟着播放进度显示、隐藏；全部带上 run 转发给界面
@@ -269,6 +287,9 @@ fn start_pipeline(app: &AppHandle) -> Result<(), String> {
         while let Some(ev) = rx.recv().await {
             let st = handle.state::<AppState>();
             let current = st.run.load(Ordering::Acquire) == run;
+            if current && matches!(ev, Event::DeviceLost { .. }) {
+                st.device_lost.store(true, Ordering::Release);
+            }
             let overlay = if current { st.overlay.lock().unwrap().clone() } else { None };
             if let Some(o) = overlay {
                 match &ev {
@@ -302,9 +323,44 @@ fn stop_pipeline(s: &AppState) {
     }
 }
 
+/// 设备断开、或麦克风用“系统默认”时默认麦克风换了：重新打开链路。打不开就记下原因，下次检查再试。
+/// 输出用“系统默认”时不用管：cpal 打开的默认输出会自己跟着系统切换。
+fn device_check(app: &AppHandle) {
+    let s = app.state::<AppState>();
+    if !s.want.load(Ordering::Acquire) {
+        return;
+    }
+    let running = s.pipeline.lock().unwrap().is_some();
+    let need = !running || s.device_lost.load(Ordering::Acquire) || {
+        let follow_default = s.settings.lock().unwrap().input.is_empty();
+        follow_default && audio::default_id(true) != s.defaults.lock().unwrap().0
+    };
+    if !need {
+        return;
+    }
+    let before = s.waiting.lock().unwrap().clone();
+    stop_pipeline(&s);
+    let now = match start_pipeline(app) {
+        Ok(()) => {
+            // 重开期间用户点了停止
+            if !s.want.load(Ordering::Acquire) {
+                stop_pipeline(&s);
+            }
+            None
+        }
+        Err(e) => Some(e),
+    };
+    *s.waiting.lock().unwrap() = now.clone();
+    // 只在等待状态变了时通知界面：每 2 秒刷新一次会打断正在设置里选设备的用户
+    if before != now {
+        let _ = app.emit("state", ());
+    }
+}
+
+/// 列设备要问 CoreAudio，可能要几百毫秒，不放在主线程上。
 #[tauri::command]
-fn snapshot(state: State<'_, AppState>) -> Snapshot {
-    snapshot_of(&state)
+async fn snapshot(app: AppHandle) -> Snapshot {
+    snapshot_of(&app.state::<AppState>())
 }
 
 #[tauri::command]
@@ -364,11 +420,15 @@ async fn start(app: AppHandle) -> Result<(), String> {
     if s.pipeline.lock().unwrap().is_some() {
         return Ok(());
     }
-    start_pipeline(&app)
+    start_pipeline(&app)?;
+    s.want.store(true, Ordering::Release);
+    Ok(())
 }
 
 #[tauri::command]
 fn stop(state: State<'_, AppState>) {
+    state.want.store(false, Ordering::Release);
+    *state.waiting.lock().unwrap() = None;
     stop_pipeline(&state);
 }
 
@@ -420,13 +480,12 @@ async fn start_overlay(app: &AppHandle) {
     if s.overlay.lock().unwrap().as_ref().is_some_and(|o| o.port == port) {
         return;
     }
-    let old = s.overlay.lock().unwrap().take();
-    if let Some(o) = old {
-        o.shutdown();
-    }
+    // 先占新端口，成功了再关旧的：新端口被占用时旧地址还能用
     match Overlay::start(port).await {
         Ok(o) => {
-            *s.overlay.lock().unwrap() = Some(o);
+            if let Some(old) = s.overlay.lock().unwrap().replace(o) {
+                old.shutdown();
+            }
             *s.overlay_error.lock().unwrap() = None;
         }
         Err(e) => *s.overlay_error.lock().unwrap() = Some(format!("{e:#}")),
@@ -449,10 +508,10 @@ fn migrate(mut s: Settings) -> Settings {
 /// 第一次运行：直播输出默认选虚拟声卡（BlackHole / VB-CABLE），找不到就用系统默认输出。
 fn first_run_settings() -> Settings {
     let mut s = Settings::default();
-    if let Ok(outs) = audio::outputs() {
-        if let Some(d) = outs.iter().find(|d| d.name.contains("BlackHole") || d.name.contains("CABLE Input")) {
-            s.output = d.id.clone();
-        }
+    if let Ok(outs) = audio::outputs()
+        && let Some(d) = outs.iter().find(|d| d.name.contains("BlackHole") || d.name.contains("CABLE Input"))
+    {
+        s.output = d.id.clone();
     }
     s
 }
@@ -495,6 +554,10 @@ fn main() {
                 path,
                 settings: Mutex::new(settings),
                 pipeline: Mutex::new(None),
+                want: AtomicBool::new(false),
+                device_lost: AtomicBool::new(false),
+                defaults: Mutex::new(Default::default()),
+                waiting: Mutex::new(None),
                 run: AtomicU64::new(0),
                 held: Arc::new(AtomicBool::new(false)),
                 key_path,
@@ -507,6 +570,13 @@ fn main() {
             register_hotkey(app.handle());
             let handle = app.handle().clone();
             tauri::async_runtime::block_on(start_overlay(&handle));
+            let h = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(DEVICE_CHECK).await;
+                    device_check(&h);
+                }
+            });
             if test.is_some() {
                 // 不在程序坞里出现
                 #[cfg(target_os = "macos")]

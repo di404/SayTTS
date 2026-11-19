@@ -88,13 +88,13 @@ async fn tts_cmd(net: &Net, args: &Args) -> Result<()> {
         let synth = tts::synthesize(net, &model, &voice, &text, |chunk| {
             first.get_or_insert(t0.elapsed());
             chunks.push((t0.elapsed(), pcm.len()));
-            if sound.is_none() {
-                if let Some(i) = chunk.iter().position(|v| v.unsigned_abs() > 300) {
-                    // 第一个有声采样在音频里的位置也算进去：它要等前面的静音播完才出声
-                    let lead = Duration::from_secs_f64((pcm.len() + i) as f64 / TTS_RATE as f64);
-                    sound = Some((t0.elapsed(), lead));
-                    keep = pcm.len() + i.saturating_sub(240);
-                }
+            if sound.is_none()
+                && let Some(i) = chunk.iter().position(|v| v.unsigned_abs() > 300)
+            {
+                // 第一个有声采样在音频里的位置也算进去：它要等前面的静音播完才出声
+                let lead = Duration::from_secs_f64((pcm.len() + i) as f64 / TTS_RATE as f64);
+                sound = Some((t0.elapsed(), lead));
+                keep = pcm.len() + i.saturating_sub(240);
             }
             pcm.extend_from_slice(&chunk);
         });
@@ -174,7 +174,7 @@ async fn stt_cmd(net: &Net, args: &Args) -> Result<()> {
                     seq.push(&silence);
                 }
                 for part in seq {
-                    for f in part.chunks_exact(FRAME) {
+                    for f in part.as_chunks::<FRAME>().0 {
                         n += 1;
                         let due = start + Duration::from_millis(20 * n as u64);
                         if let Some(d) = due.checked_duration_since(Instant::now()) {
@@ -276,7 +276,7 @@ fn devices_cmd(args: &Args) -> Result<()> {
         let outs = audio::outputs()?;
         let pick = outs.iter().find(|d| d.name.contains("BlackHole")).or_else(|| outs.iter().find(|d| d.default));
         if let Some(d) = pick {
-            let o = audio::Output::open(&d.id, |e| eprintln!("{e}"))?;
+            let o = audio::Output::open(&d.id, |e| eprintln!("{}", e.message))?;
             std::thread::sleep(Duration::from_millis(500));
             println!("已打开输出“{}”，{} Hz，0.5 秒内播出静音 {} 个采样", o.name, o.rate, o.played());
         }

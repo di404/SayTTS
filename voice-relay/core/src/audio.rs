@@ -105,6 +105,33 @@ impl Drop for StreamThread {
     }
 }
 
+/// 音频流运行中报的错。
+#[derive(Debug, Clone)]
+pub struct StreamError {
+    pub message: String,
+    /// 设备没了（拔出、被系统移除）：这条流不会再工作，要重新打开设备。
+    pub lost: bool,
+}
+
+/// 把 cpal 的错误分类。只是通知性质、流还在正常工作的（跟随默认设备切换、偶发欠载、实时优先级被拒）返回 None。
+fn classify(what: &str, e: cpal::Error) -> Option<StreamError> {
+    use cpal::ErrorKind as K;
+    match e.kind() {
+        K::DeviceChanged | K::Xrun | K::RealtimeDenied => None,
+        K::DeviceNotAvailable | K::StreamInvalidated => Some(StreamError { message: format!("{what}断开了：{e}"), lost: true }),
+        _ => Some(StreamError { message: format!("{what}出错：{e}"), lost: false }),
+    }
+}
+
+/// 系统默认设备的 id，没有时为空字符串。用来发现默认设备变了。
+pub fn default_id(input: bool) -> String {
+    let host = cpal::default_host();
+    if input { host.default_input_device() } else { host.default_output_device() }
+        .and_then(|d| d.id().ok())
+        .map(|i| i.to_string())
+        .unwrap_or_default()
+}
+
 // ---------------------------------------------------------------- 采集
 
 pub struct Capture {
@@ -114,7 +141,7 @@ pub struct Capture {
 }
 
 /// 打开麦克风。`on_audio` 在音频线程里收到单声道 f32 和设备采样率，要尽快返回。
-pub fn capture(id: &str, on_audio: impl FnMut(&[f32]) + Send + 'static, on_error: impl Fn(String) + Send + 'static) -> Result<Capture> {
+pub fn capture(id: &str, on_audio: impl FnMut(&[f32]) + Send + 'static, on_error: impl Fn(StreamError) + Send + 'static) -> Result<Capture> {
     let device = find(true, id)?;
     let name = device.description().map(|d| d.name().to_string()).unwrap_or_default();
     let cfg = device.default_input_config().context("读不到麦克风的格式")?;
@@ -122,7 +149,11 @@ pub fn capture(id: &str, on_audio: impl FnMut(&[f32]) + Send + 'static, on_error
     let format = cfg.sample_format();
     let config: StreamConfig = cfg.config();
     let stream = StreamThread::spawn(move || {
-        let err = move |e: cpal::Error| on_error(format!("麦克风出错：{e}"));
+        let err = move |e: cpal::Error| {
+            if let Some(e) = classify("麦克风", e) {
+                on_error(e);
+            }
+        };
         Ok(match format {
             SampleFormat::F32 => build_in::<f32>(&device, config, on_audio, err)?,
             SampleFormat::I16 => build_in::<i16>(&device, config, on_audio, err)?,
@@ -216,7 +247,7 @@ enum Sink {
 
 impl Output {
     /// 打开一个输出设备。`id` 为空时用系统默认输出。
-    pub fn open(id: &str, on_error: impl Fn(String) + Send + 'static) -> Result<Self> {
+    pub fn open(id: &str, on_error: impl Fn(StreamError) + Send + 'static) -> Result<Self> {
         let device = find(false, id)?;
         let name = device.description().map(|d| d.name().to_string()).unwrap_or_default();
         let cfg = device.default_output_config().context("读不到输出设备的格式")?;
@@ -226,7 +257,11 @@ impl Output {
         let ring = Ring::new();
         let r = ring.clone();
         let stream = StreamThread::spawn(move || {
-            let err = move |e: cpal::Error| on_error(format!("输出设备出错：{e}"));
+            let err = move |e: cpal::Error| {
+                if let Some(e) = classify("输出设备", e) {
+                    on_error(e);
+                }
+            };
             Ok(match format {
                 SampleFormat::F32 => build_out::<f32>(&device, config, r, err)?,
                 SampleFormat::I16 => build_out::<i16>(&device, config, r, err)?,

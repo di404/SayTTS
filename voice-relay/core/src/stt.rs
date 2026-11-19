@@ -35,6 +35,8 @@ pub enum SttEvent {
     Disconnected(String),
     Interim(String),
     Final(String),
+    /// 一句话没能送到转写服务（一直连不上），已放弃。参数是这句的时长（毫秒）。
+    Lost(u64),
 }
 
 /// 断句器交给转写器的输入。
@@ -130,6 +132,8 @@ struct Sentence {
     id: u64,
     audio: Vec<i16>,
     ended: bool,
+    /// 已经在当前连接上发过 finalize。连接断了就清掉，换新连接时整句重发。
+    sent: bool,
 }
 
 struct Actor {
@@ -145,6 +149,7 @@ struct Actor {
     speaking: bool,
     pending: Vec<i16>, // 攒够 40 ms 再发
     ids: u64,
+    /// 连续失败次数：连接失败、或连上后还没出过结果就被关。出过结果才清零。
     retry: u32,
     /// 每有动静加一；空闲计时到点时编号没变，才断开。
     idle_gen: u64,
@@ -159,10 +164,7 @@ impl Actor {
                 Msg::End => self.end_of_speech(),
                 Msg::Connected(r) => self.connected(r),
                 Msg::Session(id, ev) => self.session_event(id, ev),
-                Msg::Drop(id) => {
-                    self.sentences.retain(|s| s.id != id);
-                    self.arm_idle();
-                }
+                Msg::Drop(id) => self.drop_sentence(id),
                 Msg::Retry => {
                     if self.cur.is_none() && (self.down || self.busy()) {
                         self.connect();
@@ -202,7 +204,7 @@ impl Actor {
             self.speaking = true;
             self.idle_gen += 1;
             self.ids += 1;
-            self.sentences.push_back(Sentence { id: self.ids, audio: Vec::new(), ended: false });
+            self.sentences.push_back(Sentence { id: self.ids, audio: Vec::new(), ended: false, sent: false });
             if self.cur.is_none() {
                 self.connect(); // 连上后整句重发
             }
@@ -217,10 +219,10 @@ impl Actor {
     }
 
     fn flush(&mut self) {
-        if let Some(cur) = &self.cur {
-            if !self.pending.is_empty() {
-                cur.audio(&self.pending);
-            }
+        if let Some(cur) = &self.cur
+            && !self.pending.is_empty()
+        {
+            cur.audio(&self.pending);
         }
         self.pending.clear();
     }
@@ -231,12 +233,13 @@ impl Actor {
         }
         self.speaking = false;
         self.flush();
-        if let Some(cur) = &self.cur {
-            cur.finalize();
-        }
         if let Some(s) = self.sentences.back_mut() {
             s.ended = true;
             let id = s.id;
+            if let Some(cur) = &self.cur {
+                cur.finalize();
+                s.sent = true;
+            }
             let me = self.me.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(DROP_AFTER).await;
@@ -265,32 +268,50 @@ impl Actor {
     fn connected(&mut self, r: Result<Session>) {
         self.connecting = false;
         match r {
-            Ok(s) => {
-                self.retry = 0;
-                self.attach(s);
-            }
+            Ok(s) => self.attach(s),
             Err(e) => {
                 self.down = true;
                 let _ = self.out.send(SttEvent::Disconnected(format!("{e:#}")));
-                let wait = Duration::from_secs(1 << self.retry.min(4)); // 1, 2, 4, 8, 16 秒
-                self.retry += 1;
-                let me = self.me.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(wait).await;
-                    if let Some(me) = me.upgrade() {
-                        let _ = me.send(Msg::Retry);
-                    }
-                });
+                self.schedule_retry();
             }
         }
     }
 
+    /// 按连续失败次数退避后再连：第一次马上，之后 1, 2, 4, 8, 16 秒。
+    /// 服务端可能接受连接后立刻关掉（余额不足、key 被停用），不退避就会不停地重连。
+    fn schedule_retry(&mut self) {
+        let wait = match self.retry {
+            0 => Duration::ZERO,
+            n => Duration::from_secs(1 << (n - 1).min(4)),
+        };
+        self.retry += 1;
+        let me = self.me.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(wait).await;
+            if let Some(me) = me.upgrade() {
+                let _ = me.send(Msg::Retry);
+            }
+        });
+    }
+
+    /// 一句说完太久还没定稿：不再等它。如果它从没送到当前连接上（一直连不上），这句话就丢了，告诉界面。
+    fn drop_sentence(&mut self, id: u64) {
+        let Some(i) = self.sentences.iter().position(|s| s.id == id) else { return };
+        let s = self.sentences.remove(i).expect("下标来自 position");
+        if !s.sent {
+            let ms = s.audio.len() as u64 * 1000 / STT_RATE as u64;
+            let _ = self.out.send(SttEvent::Lost(ms));
+        }
+        self.arm_idle();
+    }
+
     /// 用一条新连接接替当前连接，并重发还没定稿的句子。
     fn attach(&mut self, s: Session) {
-        for sent in &self.sentences {
+        for sent in &mut self.sentences {
             s.audio(&sent.audio);
             if sent.ended {
                 s.finalize();
+                sent.sent = true;
             }
         }
         self.pending.clear(); // 当前句已经整句重发过
@@ -308,6 +329,7 @@ impl Actor {
         }
         match ev {
             FromSession::Final(text) => {
+                self.retry = 0;
                 if let Some(i) = self.sentences.iter().position(|s| s.ended) {
                     self.sentences.remove(i);
                 }
@@ -318,15 +340,17 @@ impl Actor {
                 self.arm_idle();
             }
             FromSession::Interim(text) => {
+                self.retry = 0;
                 let _ = self.out.send(SttEvent::Interim(text));
             }
             FromSession::Closed(reason) => {
                 self.cur = None;
+                self.sentences.iter_mut().for_each(|s| s.sent = false);
                 // 没有话在等时被关（例如到了单次会话的时长上限），等下次开口再连
                 if self.busy() {
                     self.down = true;
                     let _ = self.out.send(SttEvent::Disconnected(reason));
-                    self.connect();
+                    self.schedule_retry();
                 }
             }
         }
