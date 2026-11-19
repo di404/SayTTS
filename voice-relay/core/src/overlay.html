@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>字幕</title>
+<style>
+  html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; }
+  #line {
+    position: fixed; left: 50%; bottom: 8vh; transform: translateX(-50%);
+    box-sizing: border-box; max-width: 92vw; width: max-content;
+    padding: 0.3em 0.75em; border-radius: 0.4em;
+    font: 600 44px/1.4 "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+    color: #fff; background: rgba(0, 0, 0, 0.6); text-align: center;
+    opacity: 0; transition: opacity 120ms linear;
+  }
+  #line.on { opacity: 1; }
+</style>
+<body>
+<div id="line"></div>
+<script>
+  const line = document.getElementById("line");
+  let current = null;
+  function connect() {
+    const ws = new WebSocket(`ws://${location.host}/ws`);
+    ws.onmessage = (m) => {
+      const ev = JSON.parse(m.data);
+      if (ev.type === "show") {
+        current = ev.id;
+        line.textContent = ev.text;
+        line.classList.add("on");
+      } else if ((ev.type === "hide" && ev.id === current) || ev.type === "clear") {
+        current = null;
+        line.classList.remove("on");
+      }
+    };
+    ws.onclose = () => {
+      current = null;
+      line.classList.remove("on");
+      setTimeout(connect, 1000);
+    };
+  }
+  connect();
+</script>
+</body>
+</html>

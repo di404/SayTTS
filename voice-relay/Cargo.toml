@@ -1,0 +1,6 @@
+[workspace]
+members = ["core", "app"]
+resolver = "3"
+
+[profile.dev.package."*"]
+opt-level = 2

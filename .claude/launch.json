@@ -1,0 +1,33 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "plan",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": [
+        "-m",
+        "http.server",
+        "8765",
+        "--bind",
+        "127.0.0.1",
+        "--directory",
+        "plan"
+      ],
+      "port": 8765
+    },
+    {
+      "name": "ui-mock",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": [
+        "-m",
+        "http.server",
+        "8766",
+        "--bind",
+        "127.0.0.1",
+        "--directory",
+        "/private/tmp/claude-501/-Users-fuyingdi--claude-spares-spare-t17pgx/e1d105ae-60e2-40bd-8c7e-15bb5ab3958e/scratchpad/mock"
+      ],
+      "port": 8766
+    }
+  ]
+}

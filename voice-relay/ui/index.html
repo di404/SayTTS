@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>转写朗读</title>
+<link rel="stylesheet" href="style.css">
+<script src="main.js" defer></script>
+</head>
+<body>
+<main id="home" class="home">
+  <header class="top">
+    <button id="run" class="run" type="button">开始</button>
+    <div class="status"><span id="dot" class="dot"></span><span id="status">未开始</span></div>
+    <span id="ptt" class="ptt" hidden>说话中</span>
+    <button id="listen" class="icon" type="button" aria-label="监听" title="监听" hidden>
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 18v-6a9 9 0 0 1 18 0v6"/><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/><path class="slash" d="M3 3l18 18"/></svg>
+    </button>
+    <button id="open-settings" class="icon" type="button" aria-label="设置" title="设置">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      <span id="badge" class="badge" hidden></span>
+    </button>
+  </header>
+  <canvas id="meter" class="meter" aria-hidden="true" hidden></canvas>
+  <p id="error" class="error" hidden></p>
+
+  <section class="feed">
+    <div id="scroller" class="scroller">
+      <div id="setup" class="setup" hidden>
+        <p>需要 Fish Audio API key</p>
+        <button id="setup-go" class="primary" type="button">填写</button>
+      </div>
+      <ol id="log" class="log"></ol>
+      <p id="interim" class="interim"></p>
+    </div>
+  </section>
+
+  <form id="say-form" class="say">
+    <select id="voice-quick" class="chip" aria-label="声音" title="声音"></select>
+    <input id="say" placeholder="输入文字，回车朗读" autocomplete="off">
+    <button id="hush" class="icon" type="button" aria-label="停止朗读" title="停止朗读" hidden>
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>
+    </button>
+  </form>
+</main>
+
+<section id="settings" class="settings" hidden>
+  <header class="sheet-top">
+    <button id="close-settings" class="icon" type="button" aria-label="返回" title="返回">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
+    </button>
+    <h1>设置</h1>
+  </header>
+
+  <div class="sheet">
+    <h2>音频</h2>
+    <div class="group">
+      <div class="field"><label for="input">麦克风</label><select id="input"></select></div>
+      <div class="field"><label for="output">直播输出</label><select id="output"></select></div>
+      <div class="field">
+        <label for="monitor">监听</label><select id="monitor"></select>
+        <input id="monitor_volume" class="vol" type="range" min="0" max="100" step="5" aria-label="监听音量">
+      </div>
+      <div id="echo-box" class="field">
+        <label for="echo_gate" class="wide">外放时暂停收音</label>
+        <input id="echo_gate" type="checkbox">
+      </div>
+    </div>
+
+    <h2>断句</h2>
+    <div class="group">
+      <div class="field">
+        <span class="name">方式</span>
+        <div class="seg" role="group">
+          <button type="button" data-mode="auto">自动</button>
+          <button type="button" data-mode="ptt">按键</button>
+        </div>
+      </div>
+      <div id="gate-box" class="field">
+        <label for="gate">停顿</label>
+        <input id="gate" class="num" type="number" min="200" max="2000" step="50"><span class="unit">ms</span>
+      </div>
+      <div id="max-box" class="field">
+        <label for="max_s">最长一句</label>
+        <input id="max_s" class="num" type="number" min="3" max="60" step="1"><span class="unit">秒</span>
+      </div>
+      <div id="ptt-box" class="field">
+        <label for="ptt_key">按键</label>
+        <input id="ptt_key" class="key" readonly>
+      </div>
+    </div>
+
+    <h2>声音</h2>
+    <div class="group">
+      <div class="field">
+        <label for="voice">声音</label><select id="voice"></select>
+        <button id="preview" type="button">试听</button>
+      </div>
+      <div class="field"><label for="model">模型</label><select id="model"></select></div>
+      <div class="field"><label for="vocabulary">专有名词</label><input id="vocabulary" placeholder="例：会话，弹幕" spellcheck="false"></div>
+    </div>
+
+    <h2>字幕页</h2>
+    <div class="group">
+      <div class="field">
+        <input id="overlay" readonly aria-label="字幕页地址">
+        <button id="copy" type="button">复制</button>
+      </div>
+    </div>
+
+    <details id="advanced">
+      <summary><h2>高级</h2></summary>
+      <div class="group">
+        <div class="field">
+          <label for="key">API key</label><input id="key" type="password" autocomplete="off" spellcheck="false">
+          <button id="key-save" type="button">保存</button>
+          <button id="key-clear" type="button" hidden>清除</button>
+        </div>
+        <div class="field"><label for="proxy">代理</label><input id="proxy" placeholder="系统代理" spellcheck="false"></div>
+        <div class="field"><label for="port">字幕端口</label><input id="port" class="num" type="number" min="1024" max="65535"></div>
+      </div>
+    </details>
+  </div>
+</section>
+</body>
+</html>
