@@ -75,8 +75,7 @@ jobs:
             Windows)
               cp "$b"/nsis/*.exe "../dist/SayTTS_${GITHUB_REF_NAME}_windows_x64-setup.exe"
               cp "$b"/msi/*.msi "../dist/SayTTS_${GITHUB_REF_NAME}_windows_x64.msi"
-              exe=$(ls target/${{ matrix.target }}/release/{SayTTS,voice-relay}.exe 2>/dev/null | head -1)
-              cp "$exe" "../dist/SayTTS_${GITHUB_REF_NAME}_windows_x64_portable.exe"
+              cp target/${{ matrix.target }}/release/voice-relay.exe "../dist/SayTTS_${GITHUB_REF_NAME}_windows_x64_portable.exe"
               ;;
             Linux)
               cp "$b"/deb/*.deb "../dist/SayTTS_${GITHUB_REF_NAME}_linux_amd64.deb"
