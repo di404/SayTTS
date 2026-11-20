@@ -1,5 +1,5 @@
 [package]
-name = "voice-relay"
+name = "saytts"
 version = "0.1.0"
 edition = "2024"
 
@@ -14,7 +14,7 @@ serde_json = "1"
 tauri = { version = "2.12", features = [] }
 tauri-plugin-global-shortcut = "2.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
-voice-core = { path = "../core" }
+saytts-core = { path = "../core" }
 
 [features]
 # 默认把 ui/ 打包进程序，cargo run 不需要前端开发服务器

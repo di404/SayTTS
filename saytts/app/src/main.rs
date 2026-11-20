@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 //! 桌面外壳：设置、API key、按键说话快捷键、OBS 字幕页。
-//! 采集、转写、朗读、播放都在 voice-core 里，界面只负责显示和改设置。
+//! 采集、转写、朗读、播放都在 saytts-core 里，界面只负责显示和改设置。
 
 use std::{
     collections::HashMap,
@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Listener, Manager, State, webview::PageLoadEvent};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 use tokio::sync::mpsc;
-use voice_core::{
+use saytts_core::{
     audio::{self, DeviceInfo},
     backend::{self, Creds, PresetVoice, Provider, ProviderInfo},
     endpointer::Mode,
@@ -29,7 +29,10 @@ use voice_core::{
 };
 
 /// 旧版本把 Fish Audio 的 key 存在系统钥匙串里。只在第一次启动新版本时读一次，搬到配置目录后删掉。
+/// 名字是旧版本用的，不能改。
 const KEY_SERVICE: &str = "voice-relay";
+/// 改名为 SayTTS 之前的 bundle identifier。配置目录以它命名，新版本第一次启动时整个搬过来。
+const LEGACY_IDENTIFIER: &str = "dev.voicerelay.app";
 const KEY_ACCOUNT: &str = "fish-api-key";
 const LEGACY_KEYCHAIN_PROVIDER: &str = "fish";
 const PREVIEW_TEXT: &str = "大家好，这是现在选中的声音。";
@@ -237,6 +240,14 @@ fn write_key(path: &std::path::Path, key: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// 新配置目录还不存在、旧 identifier 的目录存在时，把旧目录改名过来（设置和 key 都在里面）。
+fn migrate_config_dir(dir: &Path) {
+    let Some(old) = dir.parent().map(|p| p.join(LEGACY_IDENTIFIER)) else { return };
+    if !dir.exists() && old.is_dir() {
+        let _ = std::fs::rename(&old, dir);
+    }
+}
+
 /// 启动时读一次某个平台的 key。配置目录里没有、钥匙串里有（旧版本存的 Fish Audio key），就搬过来并删掉钥匙串里那条，
 /// 以后启动不再访问钥匙串（未签名的 app 每次重新编译后访问钥匙串都会弹窗）。
 /// `from_keychain` 为 false 时不碰钥匙串（测试模式的配置目录是临时目录）。
@@ -334,7 +345,7 @@ fn start_pipeline(app: &AppHandle) -> Result<(), String> {
         let st = s.settings.lock().unwrap();
         Config {
             // 开发测试用（只在调试版里有）：按实时节奏读这个 WAV 当麦克风，不打开真的麦克风
-            input: match std::env::var_os("VOICE_RELAY_TEST_WAV").filter(|_| cfg!(debug_assertions)) {
+            input: match std::env::var_os("SAYTTS_TEST_WAV").filter(|_| cfg!(debug_assertions)) {
                 Some(path) => Input::Wav(path.into()),
                 None => Input::Mic(st.input.clone()),
             },
@@ -632,14 +643,14 @@ fn first_run_settings() -> Settings {
     s
 }
 
-/// 开发测试用（只在调试版里有）：VOICE_RELAY_TEST_JS 指向一个脚本。设了它，窗口不显示，
+/// 开发测试用（只在调试版里有）：SAYTTS_TEST_JS 指向一个脚本。设了它，窗口不显示，
 /// 设置存在脚本旁边、不碰用户的设置文件，页面加载完执行这个脚本，
 /// 脚本用 "test-report" 事件发出的内容打印到标准输出。
 fn test_script() -> Option<(PathBuf, String)> {
     if !cfg!(debug_assertions) {
         return None;
     }
-    let path = PathBuf::from(std::env::var_os("VOICE_RELAY_TEST_JS")?);
+    let path = PathBuf::from(std::env::var_os("SAYTTS_TEST_JS")?);
     let js = std::fs::read_to_string(&path).ok()?;
     Some((path, js))
 }
@@ -657,7 +668,11 @@ fn main() {
         .setup(move |app| {
             let path = match &test {
                 Some((script, _)) => script.with_file_name("settings.json"),
-                None => app.path().app_config_dir()?.join("settings.json"),
+                None => {
+                    let dir = app.path().app_config_dir()?;
+                    migrate_config_dir(&dir);
+                    dir.join("settings.json")
+                }
             };
             let settings = std::fs::read_to_string(&path)
                 .ok()

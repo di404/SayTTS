@@ -1,39 +1,35 @@
 # SayTTS
 
-把麦克风里说的话实时转成文字，再用选定的声音朗读到指定的输出设备，同时提供 OBS 字幕页。转写和朗读使用 [Fish Audio](https://fish.audio)，需要自己的 API key。
+把你对着麦克风说的话转成文字，再用选好的声音念出来，送到直播或语音软件里。同时提供一个可以加进 OBS 的字幕页。
 
-## 下载
+转写和朗读由 [Fish Audio](https://fish.audio) 提供，需要你自己的 API key。
 
-在 [Releases](../../releases) 里下载对应平台的安装包：
+## 下载安装
 
-| 平台 | 文件 |
+在 [Releases](../../releases) 下载对应系统的文件：
+
+| 系统 | 文件 |
 | --- | --- |
 | macOS（Apple 芯片） | `*_macos_arm64.dmg` |
 | macOS（Intel） | `*_macos_x64.dmg` |
-| Windows | `*_windows_x64-setup.exe`、`*.msi`，或免安装的 `*_portable.exe` |
-| Linux | `*.AppImage`、`*.deb`、`*.rpm` |
+| Windows | `*_windows_x64-setup.exe`，或免安装的 `*_portable.exe` |
+| Linux | `*.AppImage`、`*.deb` 或 `*.rpm` |
 
-安装包没有签名：
+安装包没有签名，第一次打开可能被系统拦下：
 
-- macOS 提示“已损坏”或“无法验证开发者”时，执行 `xattr -dr com.apple.quarantine /Applications/SayTTS.app`。
-- Windows SmartScreen 拦截时，点“更多信息 → 仍要运行”。
+- macOS 提示“已损坏”或“无法验证开发者”：在终端执行 `xattr -dr com.apple.quarantine /Applications/SayTTS.app`
+- Windows 弹出 SmartScreen：点“更多信息”→“仍要运行”
 
-## 从源码构建
+## 使用
 
-需要 Rust 和 Node.js（用于 Tauri CLI）。
+1. 第一次打开时填入 Fish Audio 的 API key。
+2. 在设置里选择麦克风和直播输出设备。
+3. 选一个声音，点开始，然后说话。
 
-```bash
-cd voice-relay/app
-npx @tauri-apps/cli@2 build
-```
+想让直播软件或语音软件收到朗读的声音，需要一个虚拟声卡：macOS 可用 [BlackHole](https://github.com/ExistentialAudio/BlackHole)，Windows 可用 [VB-CABLE](https://vb-audio.com/Cable/)。把“直播输出”设为虚拟声卡，再在直播或语音软件里把它选作麦克风。
 
-开发时直接运行：
+不说话时也可以在底部输入框打字，回车朗读。
 
-```bash
-cd voice-relay
-cargo run -p voice-relay
-```
+### OBS 字幕
 
-## 发布
-
-推送 `v*` 标签后，GitHub Actions 会在 macOS、Windows、Linux 上构建并创建 Release。
+在设置的“字幕页”里复制地址，在 OBS 里添加“浏览器”来源并粘贴这个地址。

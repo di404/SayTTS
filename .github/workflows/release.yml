@@ -30,7 +30,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     defaults:
       run:
-        working-directory: voice-relay
+        working-directory: saytts
     steps:
       - uses: actions/checkout@v4
 
@@ -46,7 +46,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: voice-relay
+          workspaces: saytts
           key: ${{ matrix.target }}
 
       - name: Test
@@ -58,7 +58,7 @@ jobs:
           node-version: 22
 
       - name: Build
-        working-directory: voice-relay/app
+        working-directory: saytts/app
         run: npx -y @tauri-apps/cli@2 build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
 
       - name: Collect bundles
@@ -75,7 +75,7 @@ jobs:
             Windows)
               cp "$b"/nsis/*.exe "../dist/SayTTS_${GITHUB_REF_NAME}_windows_x64-setup.exe"
               cp "$b"/msi/*.msi "../dist/SayTTS_${GITHUB_REF_NAME}_windows_x64.msi"
-              cp target/${{ matrix.target }}/release/voice-relay.exe "../dist/SayTTS_${GITHUB_REF_NAME}_windows_x64_portable.exe"
+              cp target/${{ matrix.target }}/release/saytts.exe "../dist/SayTTS_${GITHUB_REF_NAME}_windows_x64_portable.exe"
               ;;
             Linux)
               cp "$b"/deb/*.deb "../dist/SayTTS_${GITHUB_REF_NAME}_linux_amd64.deb"

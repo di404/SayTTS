@@ -16,7 +16,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
-use voice_core::{
+use saytts_core::{
     audio,
     endpointer::{Endpointer, FRAME, Mode},
     pipeline::{Config, Event, Input, Pipeline, Sink},

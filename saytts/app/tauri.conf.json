@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "SayTTS",
   "version": "0.1.0",
-  "identifier": "dev.voicerelay.app",
+  "identifier": "dev.saytts.app",
   "build": {
     "frontendDist": "../ui"
   },

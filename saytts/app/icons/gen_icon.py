@@ -3,7 +3,7 @@
 Five rounded bars as a voice waveform, one bar in an accent color.
 Pick a palette with VARIANT; rerun to regenerate every size.
 
-    python3 voice-relay/app/icons/gen_icon.py
+    python3 saytts/app/icons/gen_icon.py
 """
 
 from PIL import Image, ImageDraw, ImageFilter, ImageChops
