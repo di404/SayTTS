@@ -3,4 +3,3 @@
 *.js linguist-detectable=false
 *.css linguist-detectable=false
 saytts/ui/** linguist-vendored
-spike/** linguist-vendored

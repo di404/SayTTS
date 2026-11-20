@@ -4,7 +4,7 @@ node_modules/
 .DS_Store
 /转写朗读.app/
 /SayTTS.app/
-/spike/out/
+spike/
 
 plan/
 .claude/
