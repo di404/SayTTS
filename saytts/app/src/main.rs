@@ -28,8 +28,6 @@ use saytts_core::{
     tts::{Tts, Voice},
 };
 
-/// 改名为 SayTTS 之前的 bundle identifier。配置目录以它命名，新版本第一次启动时整个搬过来。
-const LEGACY_IDENTIFIER: &str = "dev.voicerelay.app";
 const PREVIEW_TEXT: &str = "大家好，这是现在选中的声音。";
 /// 一句播完后，字幕再留这么久。
 const LINGER: std::time::Duration = std::time::Duration::from_millis(1500);
@@ -233,14 +231,6 @@ fn write_key(path: &std::path::Path, key: &str) -> std::io::Result<()> {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
-}
-
-/// 新配置目录还不存在、旧 identifier 的目录存在时，把旧目录改名过来（设置和 key 都在里面）。
-fn migrate_config_dir(dir: &Path) {
-    let Some(old) = dir.parent().map(|p| p.join(LEGACY_IDENTIFIER)) else { return };
-    if !dir.exists() && old.is_dir() {
-        let _ = std::fs::rename(&old, dir);
-    }
 }
 
 /// 启动时读一次某个平台的 key：先读配置目录里在设置中填过的，没有再看环境变量。
@@ -650,11 +640,7 @@ fn main() {
         .setup(move |app| {
             let path = match &test {
                 Some((script, _)) => script.with_file_name("settings.json"),
-                None => {
-                    let dir = app.path().app_config_dir()?;
-                    migrate_config_dir(&dir);
-                    dir.join("settings.json")
-                }
+                None => app.path().app_config_dir()?.join("settings.json"),
             };
             let settings = std::fs::read_to_string(&path)
                 .ok()
