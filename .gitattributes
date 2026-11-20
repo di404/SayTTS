@@ -1,0 +1,6 @@
+# Exclude frontend / docs from GitHub language statistics so the repo shows as Rust
+*.html linguist-detectable=false
+*.js linguist-detectable=false
+*.css linguist-detectable=false
+saytts/ui/** linguist-vendored
+spike/** linguist-vendored
