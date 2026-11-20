@@ -28,13 +28,8 @@ use saytts_core::{
     tts::{Tts, Voice},
 };
 
-/// 旧版本把 Fish Audio 的 key 存在系统钥匙串里。只在第一次启动新版本时读一次，搬到配置目录后删掉。
-/// 名字是旧版本用的，不能改。
-const KEY_SERVICE: &str = "voice-relay";
 /// 改名为 SayTTS 之前的 bundle identifier。配置目录以它命名，新版本第一次启动时整个搬过来。
 const LEGACY_IDENTIFIER: &str = "dev.voicerelay.app";
-const KEY_ACCOUNT: &str = "fish-api-key";
-const LEGACY_KEYCHAIN_PROVIDER: &str = "fish";
 const PREVIEW_TEXT: &str = "大家好，这是现在选中的声音。";
 /// 一句播完后，字幕再留这么久。
 const LINGER: std::time::Duration = std::time::Duration::from_millis(1500);
@@ -248,25 +243,12 @@ fn migrate_config_dir(dir: &Path) {
     }
 }
 
-/// 启动时读一次某个平台的 key。配置目录里没有、钥匙串里有（旧版本存的 Fish Audio key），就搬过来并删掉钥匙串里那条，
-/// 以后启动不再访问钥匙串（未签名的 app 每次重新编译后访问钥匙串都会弹窗）。
-/// `from_keychain` 为 false 时不碰钥匙串（测试模式的配置目录是临时目录）。
-fn load_key(dir: &Path, p: &Provider, from_keychain: bool) -> Option<(String, &'static str)> {
-    let path = &key_path(dir, p.id);
-    let from_keychain = from_keychain && p.id == LEGACY_KEYCHAIN_PROVIDER;
-    if let Ok(k) = std::fs::read_to_string(path) {
+/// 启动时读一次某个平台的 key：先读配置目录里在设置中填过的，没有再看环境变量。
+fn load_key(dir: &Path, p: &Provider) -> Option<(String, &'static str)> {
+    if let Ok(k) = std::fs::read_to_string(key_path(dir, p.id)) {
         let k = k.trim();
         if !k.is_empty() {
             return Some((k.to_string(), "saved"));
-        }
-    }
-    if let Some(entry) = keyring::Entry::new(KEY_SERVICE, KEY_ACCOUNT).ok().filter(|_| from_keychain)
-        && let Ok(k) = entry.get_password()
-    {
-        let k = k.trim().to_string();
-        if !k.is_empty() && write_key(path, &k).is_ok() {
-            let _ = entry.delete_credential();
-            return Some((k, "saved"));
         }
     }
     env_key(p)
@@ -686,7 +668,7 @@ fn main() {
             let key_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
             let keys = backend::PROVIDERS
                 .iter()
-                .filter_map(|p| Some((p.id, load_key(&key_dir, p, test.is_none())?)))
+                .filter_map(|p| Some((p.id, load_key(&key_dir, p)?)))
                 .collect();
             app.manage(AppState {
                 path,
