@@ -331,6 +331,20 @@ impl Output {
         self.rs.reset();
     }
 
+    /// 丢掉 `pos` 及以后的音频（位置同 `written`），之前的照常播。
+    /// `pos` 已经播过时等于全部丢掉。之后送入的音频从截断处接着排。
+    pub fn cut_from(&mut self, pos: u64) {
+        let mut q = self.ring.buf.lock().unwrap();
+        // 队列里是 [written - len, written) 这一段；不用 played，它在回调里比队列晚一步更新
+        let first = self.written - q.len() as u64;
+        let keep = pos.saturating_sub(first).min(q.len() as u64);
+        let dropped = q.len() as u64 - keep;
+        q.truncate(keep as usize);
+        drop(q);
+        self.written -= dropped;
+        self.rs.reset();
+    }
+
     pub fn finish_wav(self) {
         if let Sink::Wav(w) = self._sink {
             w.finish();

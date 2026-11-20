@@ -381,6 +381,7 @@ fn start_pipeline(app: &AppHandle) -> Result<(), String> {
                             o.hide(id);
                         });
                     }
+                    Event::Stopped { id } => o.hide(key(*id)),
                     Event::Cleared => o.clear(),
                     _ => {}
                 }
@@ -537,10 +538,14 @@ fn say(state: State<'_, AppState>, text: String) -> Result<(), String> {
     }
 }
 
+/// 停掉一句（界面上句子的停止按钮）。`run` 不是当前这次时忽略：句子编号每次从 1 起。
 #[tauri::command]
-fn stop_speech(state: State<'_, AppState>) {
+fn skip_speech(state: State<'_, AppState>, run: u64, id: u64) {
+    if state.run.load(Ordering::Acquire) != run {
+        return;
+    }
     if let Some(p) = state.pipeline.lock().unwrap().as_ref() {
-        p.stop_speech();
+        p.skip_speech(id);
     }
 }
 
@@ -713,7 +718,7 @@ fn main() {
             start,
             stop,
             say,
-            stop_speech,
+            skip_speech,
             preview,
             account_voices
         ])

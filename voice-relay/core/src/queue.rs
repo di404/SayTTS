@@ -37,6 +37,8 @@ pub enum QueueEvent {
     /// `stall_ms`：开始播放到播完用的时间，比这句音频长出多少。合成跟不上播放、中途断音时大于 0。
     Done { id: u64, stall_ms: u64 },
     Failed { id: u64, error: String },
+    /// 单独停掉的一句
+    Stopped { id: u64 },
     Cleared,
 }
 
@@ -48,6 +50,7 @@ pub struct SpeechQueue {
 enum Cmd {
     Say(String),
     Stop,
+    Skip(u64),
     Voice(VoiceConfig),
     Warm,
 }
@@ -87,6 +90,11 @@ impl SpeechQueue {
         let _ = self.tx.send(Cmd::Stop);
     }
 
+    /// 只停掉一句（正在播或还在排队），其余照常。
+    pub fn skip(&self, id: u64) {
+        let _ = self.tx.send(Cmd::Skip(id));
+    }
+
     pub fn set_voice(&self, v: VoiceConfig) {
         let _ = self.tx.send(Cmd::Voice(v));
     }
@@ -115,6 +123,7 @@ struct Item {
     fed: usize,
     lead_done: bool,
     start: Option<u64>, // 第一个采样在直播输出上的位置
+    mstart: Option<u64>, // 第一个采样在监听输出上的位置
     end: Option<u64>,   // 最后一个采样之后的位置；有值表示整句已送完
     shown: Option<Instant>, // 开始播放的时刻
 }
@@ -155,6 +164,7 @@ impl Actor {
         match c {
             Cmd::Say(text) => self.say(text),
             Cmd::Stop => self.stop(),
+            Cmd::Skip(id) => self.skip(id),
             Cmd::Voice(v) => self.voice = v,
             Cmd::Warm => {
                 if self.last_request.is_none_or(|t| t.elapsed() > WARM_AFTER) {
@@ -189,7 +199,7 @@ impl Actor {
             wake.notify_one();
         });
         let _ = self.events.send(QueueEvent::Added { id, text: text.clone() });
-        self.items.push_back(Item { id, text, audio, task, fed: 0, lead_done: false, start: None, end: None, shown: None });
+        self.items.push_back(Item { id, text, audio, task, fed: 0, lead_done: false, start: None, mstart: None, end: None, shown: None });
     }
 
     /// 按顺序把已合成的音频送进输出；前一句没送完，不送后一句。
@@ -246,6 +256,7 @@ impl Actor {
         it.start.get_or_insert(self.live.written());
         self.live.push(chunk);
         if let Some(m) = &mut self.monitor {
+            it.mstart.get_or_insert(m.written());
             m.push(chunk);
         }
     }
@@ -273,6 +284,29 @@ impl Actor {
                 _ => break,
             }
         }
+    }
+
+    /// 停掉一句。它的音频已经送进输出时，从它开头截断输出；排在它后面、已经送进去的句子
+    /// 跟着被截掉，从头重新送（合成好的音频都还在）。排在它前面的不受影响。
+    fn skip(&mut self, id: u64) {
+        let Some(i) = self.items.iter().position(|it| it.id == id) else { return };
+        let it = self.items.remove(i).unwrap();
+        it.task.abort();
+        if let Some(start) = it.start {
+            self.live.cut_from(start);
+            if let (Some(m), Some(ms)) = (&mut self.monitor, it.mstart) {
+                m.cut_from(ms);
+            }
+            for later in self.items.iter_mut().skip(i) {
+                later.fed = 0;
+                later.lead_done = false;
+                later.start = None;
+                later.mstart = None;
+                later.end = None;
+                later.shown = None;
+            }
+        }
+        let _ = self.events.send(QueueEvent::Stopped { id });
     }
 
     fn stop(&mut self) {

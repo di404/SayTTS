@@ -72,6 +72,7 @@ pub enum Event {
     Playing { id: u64, text: String },
     Done { id: u64, stall_ms: u64 },
     Failed { id: u64, error: String },
+    Stopped { id: u64 },
     Cleared,
     Level { level: f32, threshold: f32, speaking: bool },
     /// 一句话因为一直连不上转写服务而丢掉。`ms` 是这句的时长。
@@ -176,6 +177,7 @@ impl Pipeline {
                     QueueEvent::Playing { id, text } => Event::Playing { id, text },
                     QueueEvent::Done { id, stall_ms } => Event::Done { id, stall_ms },
                     QueueEvent::Failed { id, error } => Event::Failed { id, error },
+                    QueueEvent::Stopped { id } => Event::Stopped { id },
                     QueueEvent::Cleared => Event::Cleared,
                 });
             }
@@ -263,8 +265,9 @@ impl Pipeline {
     }
 
     /// 停止正在读的句子并清空队列。
-    pub fn stop_speech(&self) {
-        self.queue.stop();
+    /// 停掉一句，其余照常朗读。
+    pub fn skip_speech(&self, id: u64) {
+        self.queue.skip(id);
     }
 
     /// 打字输入，或重试读失败的句子：和语音定稿进同一个队列。

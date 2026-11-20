@@ -163,6 +163,28 @@ input:focus, select:focus-visible, button:focus-visible { outline: 2px solid var
 .log .why { display: block; margin-top: 2px; color: var(--bad); font-size: 12px; }
 .log .tag { flex: none; display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--faint); }
 .log .retry { flex: none; align-self: center; padding: 1px 9px; font-size: 12px; }
+/* 停止这一句：播放中的句子一直显示，排队合成中的悬停时显示 */
+.log .skip {
+  flex: none;
+  align-self: center;
+  display: none;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  margin: -4px -4px -4px 0;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--muted);
+  transition: background 120ms, color 120ms, opacity 120ms;
+}
+.log .skip:hover { background: color-mix(in srgb, var(--bad) 14%, transparent); color: var(--bad); }
+.log li.play .skip, .log li.busy .skip { display: grid; }
+.log li.play .skip { color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.log li.play .skip:hover { color: var(--bad); background: color-mix(in srgb, var(--bad) 14%, transparent); }
+.log li.busy .skip { opacity: 0; }
+.log li.busy:hover .skip, .log li.busy .skip:focus-visible { opacity: 1; }
 
 .log li.busy .text { color: var(--muted); }
 .log li.busy .tag::before {
@@ -347,20 +369,6 @@ input:focus, select:focus-visible, button:focus-visible { outline: 2px solid var
 /* WebKit 里下拉框一获得焦点就算 focus-visible，所以只在用键盘导航时画焦点环 */
 .kbd .voice:has(select:focus) { box-shadow: 0 0 0 2px var(--accent); }
 .voice .caret { opacity: 0.7; }
-
-.hush {
-  flex: none;
-  display: inline-grid;
-  place-items: center;
-  width: 30px;
-  height: 30px;
-  padding: 0;
-  border: 0;
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--bad) 12%, transparent);
-  color: var(--bad);
-}
-.hush:hover { background: color-mix(in srgb, var(--bad) 20%, transparent); }
 
 ::view-transition-group(dock), ::view-transition-group(say) { animation-duration: 320ms; animation-timing-function: var(--ease); }
 

@@ -336,7 +336,7 @@ function setRunning(on) {
     resetMeter();
     $("interim").textContent = "";
     $("ptt").hidden = true;
-    updateHush();
+    updateRows();
   } else if (!was) {
     setStatus("连接中", "wait");
   }
@@ -359,8 +359,6 @@ $("run").addEventListener("click", async () => {
     refresh();
   }
 });
-
-$("hush").addEventListener("click", () => call("stop_speech"));
 
 $("say-form").addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -493,7 +491,13 @@ requestAnimationFrame(drawMeter); // 没开始时也画出一排最短的柱子
 
 function row(id, text) {
   const k = `${run}:${id}`;
-  return rows.get(k) || newRow(k, text);
+  let li = rows.get(k);
+  if (!li) {
+    li = newRow(k, text);
+    li.dataset.run = run;
+    li.dataset.id = id;
+  }
+  return li;
 }
 
 function newRow(k, text) {
@@ -503,7 +507,13 @@ function newRow(k, text) {
   t.textContent = text;
   const tag = document.createElement("span");
   tag.className = "tag";
-  li.append(t, tag);
+  const skip = document.createElement("button");
+  skip.className = "skip";
+  skip.type = "button";
+  skip.title = skip.ariaLabel = "停止这一句";
+  skip.innerHTML = '<svg viewBox="0 0 24 24" width="10" height="10" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="3"/></svg>';
+  skip.addEventListener("click", () => call("skip_speech", { run: Number(li.dataset.run), id: Number(li.dataset.id) }));
+  li.append(t, tag, skip);
   follow(() => $("log").append(li));
   rows.set(k, li);
   while (rows.size > MAX_ROWS) {
@@ -511,28 +521,21 @@ function newRow(k, text) {
     el.remove();
     rows.delete(old);
   }
-  updateHush();
+  updateRows();
   return li;
 }
 
 function mark(li, cls, tag) {
   li.className = cls;
   li.querySelector(".tag").textContent = tag;
-  updateHush();
+  updateRows();
 }
 
 const isActive = (li) => li.className === "busy" || li.className === "play";
 
-// 有句子在合成或播放时才需要「停止朗读」；有读完的句子才需要「清空」
-function updateHush() {
-  let active = false;
-  let finished = false;
-  for (const li of rows.values()) {
-    if (isActive(li)) active = true;
-    else finished = true;
-  }
-  $("hush").hidden = !active;
-  $("clear").hidden = !finished;
+// 有读完的句子才需要「清空」
+function updateRows() {
+  $("clear").hidden = ![...rows.values()].some((li) => !isActive(li));
   updateEmpty();
 }
 
@@ -556,7 +559,7 @@ $("clear").addEventListener("click", () => {
     li.remove();
     rows.delete(k);
   }
-  updateHush();
+  updateRows();
 });
 
 // 用户停在底部时，新内容进来就跟着滚；往上翻看时不打扰
@@ -619,6 +622,11 @@ function onEvent(ev) {
       retry.textContent = "重试";
       retry.addEventListener("click", () => call("say", { text }).then(() => retry.remove()));
       li.insertBefore(retry, li.querySelector(".tag"));
+      break;
+    }
+    case "stopped": {
+      const li = rows.get(`${run}:${ev.id}`);
+      if (li) mark(li, "stop", "已停止");
       break;
     }
     case "cleared":
