@@ -7,3 +7,4 @@ node_modules/
 /spike/out/
 
 plan/
+.claude/
