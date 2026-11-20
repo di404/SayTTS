@@ -1,0 +1,110 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bundles: app,dmg
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            bundles: app,dmg
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: nsis,msi
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundles: deb,rpm,appimage
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: voice-relay
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libasound2-dev libxdo-dev libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: voice-relay
+          key: ${{ matrix.target }}
+
+      - name: Test
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: cargo test --workspace --target ${{ matrix.target }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build
+        working-directory: voice-relay/app
+        run: npx -y @tauri-apps/cli@2 build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+
+      - name: Collect bundles
+        shell: bash
+        run: |
+          mkdir -p ../dist
+          b=target/${{ matrix.target }}/release/bundle
+          case "${{ runner.os }}" in
+            macOS)
+              arch=$([ "${{ matrix.target }}" = aarch64-apple-darwin ] && echo arm64 || echo x64)
+              cp "$b"/dmg/*.dmg "../dist/SayTTS_${GITHUB_REF_NAME}_macos_${arch}.dmg"
+              tar -C "$b/macos" -czf "../dist/SayTTS_${GITHUB_REF_NAME}_macos_${arch}.app.tar.gz" SayTTS.app
+              ;;
+            Windows)
+              cp "$b"/nsis/*.exe "../dist/SayTTS_${GITHUB_REF_NAME}_windows_x64-setup.exe"
+              cp "$b"/msi/*.msi "../dist/SayTTS_${GITHUB_REF_NAME}_windows_x64.msi"
+              exe=$(ls target/${{ matrix.target }}/release/{SayTTS,voice-relay}.exe 2>/dev/null | head -1)
+              cp "$exe" "../dist/SayTTS_${GITHUB_REF_NAME}_windows_x64_portable.exe"
+              ;;
+            Linux)
+              cp "$b"/deb/*.deb "../dist/SayTTS_${GITHUB_REF_NAME}_linux_amd64.deb"
+              cp "$b"/rpm/*.rpm "../dist/SayTTS_${GITHUB_REF_NAME}_linux_x86_64.rpm"
+              cp "$b"/appimage/*.AppImage "../dist/SayTTS_${GITHUB_REF_NAME}_linux_x86_64.AppImage"
+              ;;
+          esac
+          ls -la ../dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "SayTTS $GITHUB_REF_NAME" \
+            --generate-notes

@@ -3,4 +3,5 @@ node_modules/
 *.packed.html
 .DS_Store
 /转写朗读.app/
+/SayTTS.app/
 /spike/out/
