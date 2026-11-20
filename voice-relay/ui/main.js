@@ -11,6 +11,13 @@ let mode = "auto";
 // 第几次开始。句子编号每次从 1 起；换设置重启时上一次的事件可能晚到，只认这一次的
 let run = 0;
 const rows = new Map();
+let lostCount = 0;
+let lastProblem = "";
+
+if (/Mac/.test(navigator.platform)) document.body.classList.add("mac");
+// 区分键盘和鼠标操作，下拉框的焦点环只给键盘用户看
+document.addEventListener("keydown", (e) => { if (e.key === "Tab") document.body.classList.add("kbd"); });
+document.addEventListener("mousedown", () => document.body.classList.remove("kbd"));
 
 // ---------------------------------------------------------------- 错误
 
@@ -36,6 +43,7 @@ function setValue(el, v) {
 }
 
 function fillDevices(sel, list, value, first) {
+  if (document.activeElement === sel) return; // 用户正在选
   sel.replaceChildren(new Option(first, ""));
   for (const d of list) sel.add(new Option(d.name, d.id));
   if (value && !list.some((d) => d.id === value)) sel.add(new Option("已断开的设备", value));
@@ -63,31 +71,38 @@ function render(s) {
   setValue($("ptt_key"), st.ptt_key);
   $("ptt_key").classList.toggle("bad", !!s.hotkey_error);
 
-  fillVoices($("voice"), s.voices, (v) => `${v.name} · ${v.trait_zh}`, st.voice);
-  fillVoices($("voice-quick"), s.voices, (v) => v.name, st.voice);
+  fillVoices($("voice"), s.voices, (v) => `${v.name} · ${v.desc}`, s.voice.voice);
+  fillVoices($("voice-quick"), s.voices, (v) => v.name, s.voice.voice);
+  fitSelect($("voice-quick"));
 
   $("listen").hidden = !st.monitor;
   $("listen").setAttribute("aria-pressed", String(!st.monitor_muted));
   $("listen").title = st.monitor_muted ? "监听已关" : "监听中";
   $("model").replaceChildren(...s.models.map((m) => new Option(m, m)));
-  $("model").value = st.model;
+  $("model").value = s.voice.model;
   setValue($("vocabulary"), st.vocabulary.join("，"));
   setValue($("proxy"), st.proxy);
 
-  $("key").placeholder = { saved: "已保存", env: "使用环境变量 FISH_API_KEY" }[s.key_source] || "粘贴 Fish Audio API key";
-  $("key-clear").hidden = s.key_source !== "saved";
-  $("setup").hidden = !!s.key_source;
+  fillProviders("tts", s.providers, st.tts_provider);
+  fillProviders("stt", s.providers, st.stt_provider);
+  renderKeys(s.keys);
+  const missing = missingKeys(s);
+  $("setup-text").textContent = `需要 ${missing.map((k) => k.name).join("、")} API key`;
+  $("setup").hidden = !missing.length;
 
   $("overlay").value = s.overlay_url || "";
   $("overlay").classList.toggle("bad", !!s.overlay_error);
   setValue($("port"), st.overlay_port);
 
-  setRunning(s.running);
-  const needsKey = !s.key_source;
+  setRunning(s.running || s.want);
+  if (s.want && !s.running) setStatus("等待设备", "wait", s.waiting);
+  const needsKey = missing.length > 0;
   $("badge").hidden = !(needsKey || s.hotkey_error || s.overlay_error);
   if (needsKey || s.overlay_error) $("advanced").open = true;
-  const problem = s.hotkey_error || s.overlay_error;
-  if (problem) showError(problem);
+  // 同一个问题只弹一次，用户点掉后刷新不再弹出来
+  const problem = s.hotkey_error || s.overlay_error || (s.want && !s.running && s.waiting) || "";
+  if (problem && problem !== lastProblem) showError(problem);
+  lastProblem = problem;
 }
 
 function collect() {
@@ -102,8 +117,12 @@ function collect() {
     ptt_key: $("ptt_key").value.trim(),
     gate_ms: Number($("gate").value) || 500,
     max_s: Number($("max_s").value) || 10,
-    model: $("model").value,
-    voice: $("voice").value,
+    tts_provider: $("tts_provider").value || snap.settings.tts_provider,
+    stt_provider: $("stt_provider").value || snap.settings.stt_provider,
+    // 声音只属于当前朗读平台；换了朗读平台时，这次不改声音，用新平台上次的选择
+    voices: $("tts_provider").value && $("tts_provider").value !== snap.settings.tts_provider
+      ? snap.settings.voices
+      : { ...snap.settings.voices, [snap.settings.tts_provider]: { model: $("model").value, voice: $("voice").value } },
     vocabulary: $("vocabulary").value.split(/[,，、\n]/).map((w) => w.trim()).filter(Boolean),
     proxy: $("proxy").value.trim(),
     overlay_port: Number($("port").value) || 7788,
@@ -111,7 +130,61 @@ function collect() {
 }
 
 async function save() {
+  const was = snap.settings.tts_provider;
   render(await call("save_settings", { settings: collect() }));
+  if (snap.settings.tts_provider !== was) {
+    ownVoices = []; // 账号里的声音属于原来的平台
+    render(snap);
+    loadOwnVoices();
+  }
+}
+
+const missingKeys = (s) => s.keys.filter((k) => !k.source);
+
+/** 只有一个平台能选时不显示选择框 */
+function fillProviders(kind, providers, value) {
+  const list = providers.filter((p) => p[kind]);
+  $(`${kind}-provider-box`).hidden = list.length < 2;
+  const sel = $(`${kind}_provider`);
+  if (document.activeElement === sel) return;
+  sel.replaceChildren(...list.map((p) => new Option(p.name, p.id)));
+  sel.value = value;
+}
+
+/** 每个正在用的平台一行 API key，放在代理那一行前面 */
+function renderKeys(keys) {
+  const old = [...document.querySelectorAll(".key-row")];
+  if (old.some((r) => r.querySelector("input") === document.activeElement)) return; // 用户正在输入
+  old.forEach((r) => r.remove());
+  for (const k of keys) {
+    const row = document.createElement("div");
+    row.className = "field key-row";
+    const id = `key-${k.provider}`;
+    const label = Object.assign(document.createElement("label"), { htmlFor: id, textContent: keys.length > 1 ? k.name : "API key" });
+    const input = Object.assign(document.createElement("input"), { id, type: "password", autocomplete: "off", spellcheck: false });
+    input.placeholder = { saved: "已保存", env: `使用环境变量 ${k.key_env}` }[k.source] || `粘贴 ${k.name} API key`;
+    const saveBtn = Object.assign(document.createElement("button"), { type: "button", textContent: "保存" });
+    const clearBtn = Object.assign(document.createElement("button"), { type: "button", textContent: "清除", hidden: k.source !== "saved" });
+    saveBtn.addEventListener("click", async () => {
+      const key = input.value.trim();
+      if (!key) return;
+      await call("set_api_key", { provider: k.provider, key });
+      input.value = "";
+      showError("");
+      input.blur();
+      await refresh();
+      loadOwnVoices();
+    });
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") saveBtn.click();
+    });
+    clearBtn.addEventListener("click", async () => {
+      await call("clear_api_key", { provider: k.provider });
+      refresh();
+    });
+    row.append(label, input, saveBtn, clearBtn);
+    $("proxy-field").before(row);
+  }
 }
 
 async function refresh() {
@@ -128,25 +201,35 @@ function fillVoices(sel, presets, label, current) {
   };
   const groups = [];
   if (ownVoices.length) groups.push(group("我的声音", ownVoices.map((v) => new Option(v.name, v.id))));
-  groups.push(group("预置声音", presets.map((v) => Object.assign(new Option(label(v), v.id), { title: v.trait_zh }))));
+  groups.push(group("预置声音", presets.map((v) => Object.assign(new Option(label(v), v.id), { title: v.desc }))));
   const known = ownVoices.some((v) => v.id === current) || presets.some((v) => v.id === current);
   sel.replaceChildren(...(known ? [] : [new Option("我的声音", current)]), ...groups);
   sel.value = current;
 }
 
+// 原生下拉框按最长的选项定宽；顶栏里只按当前选中的名字定宽
+const measure = document.createElement("canvas").getContext("2d");
+function fitSelect(sel) {
+  const opt = sel.selectedOptions[0];
+  if (!opt) return;
+  measure.font = getComputedStyle(sel).font;
+  sel.style.width = `${Math.ceil(measure.measureText(opt.textContent).width) + 2}px`;
+}
+
 async function loadOwnVoices() {
   try {
-    ownVoices = await invoke("own_voices");
+    ownVoices = await invoke("account_voices");
   } catch {
     return; // 没有 key 或网络不通：只显示预置声音
   }
   if (snap) render(snap);
 }
 
-for (const id of ["input", "output", "monitor", "monitor_volume", "echo_gate", "voice", "model", "gate", "max_s", "vocabulary", "proxy", "port"]) {
+for (const id of ["input", "output", "monitor", "monitor_volume", "echo_gate", "voice", "model", "gate", "max_s", "vocabulary", "proxy", "port", "tts_provider", "stt_provider"]) {
   $(id).addEventListener("change", save);
 }
 $("voice-quick").addEventListener("change", () => {
+  fitSelect($("voice-quick"));
   $("voice").value = $("voice-quick").value;
   save();
 });
@@ -179,23 +262,6 @@ $("ptt_key").addEventListener("keydown", (e) => {
   save();
 });
 
-$("key-save").addEventListener("click", async () => {
-  const key = $("key").value.trim();
-  if (!key) return;
-  await call("set_api_key", { key });
-  $("key").value = "";
-  showError("");
-  await refresh();
-  loadOwnVoices();
-});
-$("key").addEventListener("keydown", (e) => {
-  if (e.key === "Enter") $("key-save").click();
-});
-$("key-clear").addEventListener("click", async () => {
-  await call("clear_api_key");
-  refresh();
-});
-
 $("copy").addEventListener("click", async () => {
   const el = $("overlay");
   if (!el.value) return;
@@ -217,7 +283,8 @@ function openSettings(focusKey) {
   $("settings").hidden = false;
   if (focusKey) {
     $("advanced").open = true;
-    $("key").focus();
+    const k = snap && (missingKeys(snap)[0] || snap.keys[0]);
+    if (k) $(`key-${k.provider}`)?.focus();
   } else {
     $("close-settings").focus();
   }
@@ -258,9 +325,12 @@ function setStatus(text, cls, title) {
 
 function setRunning(on) {
   const was = $("run").classList.contains("on");
-  $("run").textContent = on ? "停止" : "开始";
+  const label = on ? "停止" : "开始";
+  $("run-label").textContent = label;
+  $("run").setAttribute("aria-label", label);
+  $("run").title = label;
   $("run").classList.toggle("on", on);
-  $("meter").hidden = !on;
+  $("stage").classList.toggle("on", on);
   if (!on) {
     setStatus("未开始");
     resetMeter();
@@ -278,7 +348,7 @@ $("run").addEventListener("click", async () => {
   try {
     if (b.classList.contains("on")) {
       await call("stop");
-    } else if (snap && !snap.key_source) {
+    } else if (snap && missingKeys(snap).length) {
       openSettings(true);
     } else {
       showError("");
@@ -352,7 +422,6 @@ function startMeter() {
 
 function stepMeter(now) {
   vis.raf = 0;
-  if ($("meter").hidden) return;
   const dt = Math.min((now - vis.last) / 1000, 0.2);
   vis.last = now;
 
@@ -378,7 +447,6 @@ function stepMeter(now) {
 
 function drawMeter() {
   const c = $("meter");
-  if (c.hidden) return;
   const dpr = window.devicePixelRatio || 1;
   const w = c.clientWidth;
   const h = c.clientHeight;
@@ -390,51 +458,60 @@ function drawMeter() {
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
   g.clearRect(0, 0, w, h);
 
-  const n = Math.max(1, Math.floor((w + GAP) / (BAR + GAP)));
-  if (vis.jitter.length !== n) {
-    vis.jitter = Array.from({ length: n }, Math.random);
-    vis.targets = Array.from({ length: n }, Math.random);
+  // 柱子从按钮两侧向外排开，靠近按钮的长，越往外越短
+  const btn = $("run");
+  const cx = w / 2;
+  const inner = btn.offsetWidth / 2 + 14;
+  const m = Math.max(1, Math.floor((cx - inner + GAP) / (BAR + GAP)));
+  if (vis.jitter.length !== m * 2) {
+    vis.jitter = Array.from({ length: m * 2 }, Math.random);
+    vis.targets = Array.from({ length: m * 2 }, Math.random);
   }
-  const x0 = (w - (n * BAR + (n - 1) * GAP)) / 2;
   const mid = h / 2;
-  const half = (n - 1) / 2;
   const css = getComputedStyle(document.documentElement);
-  g.fillStyle = css.getPropertyValue(vis.speaking ? "--accent" : "--muted");
-  g.globalAlpha = vis.speaking ? 1 : 0.55;
+  g.fillStyle = css.getPropertyValue(vis.speaking ? "--accent" : "--faint");
+  g.globalAlpha = vis.speaking ? 1 : 0.8;
   g.beginPath();
-  for (let i = 0; i < n; i++) {
-    const u = half > 0 ? Math.abs(i - half) / half : 0; // 中间 0，两端 1
-    const shape = 0.6 + 0.4 * Math.cos((u * Math.PI) / 2);
-    const v = vis.envelope * shape * (0.35 + 0.65 * vis.jitter[i]);
-    const bh = BAR + v * (h - BAR);
-    g.roundRect(x0 + i * (BAR + GAP), mid - bh / 2, BAR, bh, BAR / 2);
+  for (let side = 0; side < 2; side++) {
+    for (let k = 0; k < m; k++) {
+      const u = m > 1 ? k / (m - 1) : 0; // 贴着按钮 0，最外 1
+      const shape = 0.15 + 0.85 * Math.pow(Math.cos((u * Math.PI) / 2), 1.5);
+      const v = vis.envelope * shape * (0.35 + 0.65 * vis.jitter[side * m + k]);
+      const bh = BAR + v * (h - BAR);
+      const off = inner + k * (BAR + GAP);
+      const x = side ? cx + off : cx - off - BAR;
+      g.roundRect(x, mid - bh / 2, BAR, bh, BAR / 2);
+    }
   }
   g.fill();
   g.globalAlpha = 1;
+  btn.style.setProperty("--lvl", vis.envelope.toFixed(3));
 }
 
 window.addEventListener("resize", drawMeter);
+requestAnimationFrame(drawMeter); // 没开始时也画出一排最短的柱子
 
 function row(id, text) {
   const k = `${run}:${id}`;
-  let li = rows.get(k);
-  if (!li) {
-    li = document.createElement("li");
-    const t = document.createElement("span");
-    t.className = "text";
-    t.textContent = text;
-    const tag = document.createElement("span");
-    tag.className = "tag";
-    li.append(t, tag);
-    follow(() => $("log").append(li));
-    rows.set(k, li);
-    while (rows.size > MAX_ROWS) {
-      const [old, el] = rows.entries().next().value;
-      el.remove();
-      rows.delete(old);
-    }
-    updateHush();
+  return rows.get(k) || newRow(k, text);
+}
+
+function newRow(k, text) {
+  const li = document.createElement("li");
+  const t = document.createElement("span");
+  t.className = "text";
+  t.textContent = text;
+  const tag = document.createElement("span");
+  tag.className = "tag";
+  li.append(t, tag);
+  follow(() => $("log").append(li));
+  rows.set(k, li);
+  while (rows.size > MAX_ROWS) {
+    const [old, el] = rows.entries().next().value;
+    el.remove();
+    rows.delete(old);
   }
+  updateHush();
   return li;
 }
 
@@ -444,12 +521,43 @@ function mark(li, cls, tag) {
   updateHush();
 }
 
-// 有句子在合成或播放时才需要「停止朗读」
+const isActive = (li) => li.className === "busy" || li.className === "play";
+
+// 有句子在合成或播放时才需要「停止朗读」；有读完的句子才需要「清空」
 function updateHush() {
   let active = false;
-  for (const li of rows.values()) if (li.className === "busy" || li.className === "play") active = true;
+  let finished = false;
+  for (const li of rows.values()) {
+    if (isActive(li)) active = true;
+    else finished = true;
+  }
   $("hush").hidden = !active;
+  $("clear").hidden = !finished;
+  updateEmpty();
 }
+
+// 还没有任何句子时录音按钮居中；第一句出来后沉到底部，把空间让给列表
+// 过渡动画的回调是异步执行的，所以按目标状态判断，不看当前 class
+let emptyTarget = true;
+function updateEmpty() {
+  const empty = !rows.size && !$("interim").textContent;
+  if (empty === emptyTarget) return;
+  emptyTarget = empty;
+  const home = $("home");
+  const apply = () => home.classList.toggle("empty", emptyTarget);
+  if (document.startViewTransition && !home.hidden) document.startViewTransition(apply).finished.catch(() => {});
+  else apply();
+}
+
+// 清空读完、停止、失败的句子；还在合成或播放的留着
+$("clear").addEventListener("click", () => {
+  for (const [k, li] of rows) {
+    if (isActive(li)) continue;
+    li.remove();
+    rows.delete(k);
+  }
+  updateHush();
+});
 
 // 用户停在底部时，新内容进来就跟着滚；往上翻看时不打扰
 function follow(change) {
@@ -464,9 +572,10 @@ function onEvent(ev) {
     if (ev.run <= run) return;
     run = ev.run;
     // 上一次没读完的句子不会再有结果
-    for (const li of rows.values()) if (li.className === "busy" || li.className === "play") mark(li, "stop", "已停止");
+    for (const li of rows.values()) if (isActive(li)) mark(li, "stop", "已停止");
     setRunning(true);
     setStatus("连接中", "wait");
+    if (lastProblem) { showError(""); lastProblem = ""; } // 设备恢复了
     return;
   }
   if (ev.run !== run) return;
@@ -479,6 +588,7 @@ function onEvent(ev) {
       break;
     case "interim":
       follow(() => ($("interim").textContent = ev.text));
+      updateEmpty();
       break;
     case "final":
       $("interim").textContent = "";
@@ -491,7 +601,7 @@ function onEvent(ev) {
       break;
     case "done": {
       const li = rows.get(`${run}:${ev.id}`);
-      if (li && li.className !== "fail") mark(li, "done", "已读");
+      if (li && li.className !== "fail") mark(li, "done", "");
       break;
     }
     case "failed": {
@@ -512,10 +622,16 @@ function onEvent(ev) {
       break;
     }
     case "cleared":
-      for (const li of rows.values()) if (li.className === "busy" || li.className === "play") mark(li, "stop", "已停止");
+      for (const li of rows.values()) if (isActive(li)) mark(li, "stop", "已停止");
       break;
     case "level":
       meter(ev.level, ev.threshold, ev.speaking);
+      break;
+    case "lost":
+      mark(newRow(`lost:${++lostCount}`, `一句话没转写出来（${(ev.ms / 1000).toFixed(1)} 秒），转写服务一直连不上`), "lost", "已丢失");
+      break;
+    case "device_lost":
+      setStatus("设备断开，正在重新打开", "wait", ev.message);
       break;
     case "error":
       showError(ev.message);
@@ -524,6 +640,8 @@ function onEvent(ev) {
 }
 
 listen("pipeline", (e) => onEvent(e.payload));
+// 设备断开后后台自动重开，状态变了就刷新
+listen("state", refresh);
 listen("ptt", (e) => {
   $("ptt").hidden = !e.payload;
 });

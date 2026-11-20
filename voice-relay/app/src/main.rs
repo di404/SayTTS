@@ -4,7 +4,8 @@
 //! 采集、转写、朗读、播放都在 voice-core 里，界面只负责显示和改设置。
 
 use std::{
-    path::PathBuf,
+    collections::HashMap,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -17,20 +18,20 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 use tokio::sync::mpsc;
 use voice_core::{
     audio::{self, DeviceInfo},
+    backend::{self, Creds, PresetVoice, Provider, ProviderInfo},
     endpointer::Mode,
-    net::Net,
+    net::HttpKit,
     overlay::Overlay,
     pipeline::{Config, Event, Input, Pipeline, Sink},
     queue::{self, VoiceConfig},
-    tts,
-    voices::{self, OwnVoice, VOICES, Voice},
+    stt::Stt,
+    tts::{Tts, Voice},
 };
 
-/// 旧版本把 key 存在系统钥匙串里。只在第一次启动新版本时读一次，搬到配置目录后删掉。
+/// 旧版本把 Fish Audio 的 key 存在系统钥匙串里。只在第一次启动新版本时读一次，搬到配置目录后删掉。
 const KEY_SERVICE: &str = "voice-relay";
 const KEY_ACCOUNT: &str = "fish-api-key";
-/// key 和 settings.json 放在同一个目录，但单独一个文件：快照会把设置发给界面，key 不能跟着发过去。
-const KEY_FILE: &str = "fish-api-key";
+const LEGACY_KEYCHAIN_PROVIDER: &str = "fish";
 const PREVIEW_TEXT: &str = "大家好，这是现在选中的声音。";
 /// 一句播完后，字幕再留这么久。
 const LINGER: std::time::Duration = std::time::Duration::from_millis(1500);
@@ -56,9 +57,12 @@ struct Settings {
     gate_ms: u32,
     /// 自动断句时一句最长多少秒，超过就在下一个短停顿处切开
     max_s: u32,
-    model: String,
-    /// Fish Audio 声音的 reference_id
-    voice: String,
+    /// 朗读用哪个平台（Provider.id）
+    tts_provider: String,
+    /// 转写用哪个平台（Provider.id）
+    stt_provider: String,
+    /// 每个平台各自选的模型和声音，键是 Provider.id。换平台再换回来，原来的选择还在。
+    voices: HashMap<String, VoiceConfig>,
     /// 专有名词表
     vocabulary: Vec<String>,
     proxy: String,
@@ -78,8 +82,9 @@ impl Default for Settings {
             ptt_key: "F8".into(),
             gate_ms: 500,
             max_s: 10,
-            model: tts::MODELS[0].into(),
-            voice: VOICES[0].id.into(),
+            tts_provider: backend::default_tts().id.into(),
+            stt_provider: backend::default_stt().id.into(),
+            voices: HashMap::new(),
             vocabulary: Vec::new(),
             proxy: String::new(),
             overlay_port: 7788,
@@ -88,16 +93,42 @@ impl Default for Settings {
 }
 
 impl Settings {
+    fn tts_provider(&self) -> &'static Provider {
+        backend::find(&self.tts_provider).filter(|p| p.tts.is_some()).unwrap_or_else(backend::default_tts)
+    }
+    fn stt_provider(&self) -> &'static Provider {
+        backend::find(&self.stt_provider).filter(|p| p.stt.is_some()).unwrap_or_else(backend::default_stt)
+    }
+    /// 当前朗读平台上选的模型和声音；还没选过就用这个平台的默认值。
     fn voice_config(&self) -> VoiceConfig {
-        VoiceConfig { model: self.model.clone(), voice: self.voice.clone() }
+        let p = self.tts_provider();
+        self.voices.get(p.id).cloned().or_else(|| p.default_voice()).expect("朗读平台有默认声音")
     }
     /// 监听实际用的音量
     fn monitor_gain(&self) -> f32 {
         if self.monitor_muted { 0.0 } else { self.monitor_volume }
     }
     /// 改了这些要重启链路；只改声音或监听音量不用。
-    fn audio_part(&self) -> (&str, &str, &str, bool, &str, u32, u32, &[String], &str) {
-        (&self.input, &self.output, &self.monitor, self.echo_gate, &self.mode, self.gate_ms, self.max_s, &self.vocabulary, &self.proxy)
+    #[allow(clippy::type_complexity)]
+    fn restart_part(&self) -> (&str, &str, &str, bool, &str, u32, u32, &[String], &str, &str, &str) {
+        (
+            &self.input,
+            &self.output,
+            &self.monitor,
+            self.echo_gate,
+            &self.mode,
+            self.gate_ms,
+            self.max_s,
+            &self.vocabulary,
+            &self.proxy,
+            self.tts_provider().id,
+            self.stt_provider().id,
+        )
+    }
+    /// 正在用的平台，去重。
+    fn providers_in_use(&self) -> Vec<&'static Provider> {
+        let (t, s) = (self.tts_provider(), self.stt_provider());
+        if t.id == s.id { vec![t] } else { vec![t, s] }
     }
 }
 
@@ -116,9 +147,10 @@ struct AppState {
     /// 每次开始加一。换设置重启时，上一次的事件可能晚到，界面和字幕页只认当前这次。
     run: AtomicU64,
     held: Arc<AtomicBool>,
-    key_path: PathBuf,
-    /// 保存的 key 优先；没有就用环境变量 FISH_API_KEY。
-    key: Mutex<Option<(String, &'static str)>>,
+    /// key 和 settings.json 放在同一个目录，但每个平台单独一个文件：快照会把设置发给界面，key 不能跟着发过去。
+    key_dir: PathBuf,
+    /// 每个平台的 key 和来源（"saved" / "env"）。保存的优先；没有就用平台的环境变量。
+    keys: Mutex<HashMap<&'static str, (String, &'static str)>>,
     overlay: Mutex<Option<Overlay>>,
     overlay_error: Mutex<Option<String>>,
     hotkey: Mutex<Option<Shortcut>>,
@@ -128,7 +160,11 @@ struct AppState {
 #[derive(Serialize)]
 struct Snapshot {
     settings: Settings,
-    key_source: Option<&'static str>,
+    /// 当前朗读平台上选的模型和声音
+    voice: VoiceConfig,
+    providers: Vec<ProviderInfo>,
+    /// 正在用的平台的 key 状态
+    keys: Vec<KeyInfo>,
     running: bool,
     want: bool,
     waiting: Option<String>,
@@ -137,14 +173,38 @@ struct Snapshot {
     hotkey_error: Option<String>,
     inputs: Vec<DeviceInfo>,
     outputs: Vec<DeviceInfo>,
-    voices: Vec<Voice>,
+    /// 当前朗读平台的预置声音和模型
+    voices: Vec<PresetVoice>,
     models: Vec<&'static str>,
 }
 
+#[derive(Serialize)]
+struct KeyInfo {
+    provider: &'static str,
+    name: &'static str,
+    key_env: &'static str,
+    /// "saved" / "env"；没有 key 是 None
+    source: Option<&'static str>,
+}
+
 fn snapshot_of(s: &AppState) -> Snapshot {
+    let settings = s.settings.lock().unwrap().clone();
+    let tts = settings.tts_provider().tts.as_ref().expect("朗读平台");
+    let keys = {
+        let k = s.keys.lock().unwrap();
+        settings
+            .providers_in_use()
+            .into_iter()
+            .map(|p| KeyInfo { provider: p.id, name: p.name, key_env: p.key_env, source: k.get(p.id).map(|(_, src)| *src) })
+            .collect()
+    };
     Snapshot {
-        settings: s.settings.lock().unwrap().clone(),
-        key_source: s.key.lock().unwrap().as_ref().map(|(_, src)| *src),
+        voice: settings.voice_config(),
+        providers: backend::PROVIDERS.iter().map(Provider::info).collect(),
+        keys,
+        voices: tts.voices.to_vec(),
+        models: tts.models.to_vec(),
+        settings,
         running: s.pipeline.lock().unwrap().is_some(),
         want: s.want.load(Ordering::Acquire),
         waiting: s.waiting.lock().unwrap().clone(),
@@ -153,13 +213,15 @@ fn snapshot_of(s: &AppState) -> Snapshot {
         hotkey_error: s.hotkey_error.lock().unwrap().clone(),
         inputs: audio::inputs().unwrap_or_default(),
         outputs: audio::outputs().unwrap_or_default(),
-        voices: VOICES.to_vec(),
-        models: tts::MODELS.to_vec(),
     }
 }
 
-fn env_key() -> Option<(String, &'static str)> {
-    std::env::var("FISH_API_KEY").ok().filter(|k| !k.trim().is_empty()).map(|k| (k, "env"))
+fn key_path(dir: &Path, provider: &str) -> PathBuf {
+    dir.join(format!("{provider}-api-key"))
+}
+
+fn env_key(p: &Provider) -> Option<(String, &'static str)> {
+    std::env::var(p.key_env).ok().filter(|k| !k.trim().is_empty()).map(|k| (k, "env"))
 }
 
 fn write_key(path: &std::path::Path, key: &str) -> std::io::Result<()> {
@@ -175,10 +237,12 @@ fn write_key(path: &std::path::Path, key: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// 启动时读一次 key。配置目录里没有、钥匙串里有（旧版本存的），就搬过来并删掉钥匙串里那条，
+/// 启动时读一次某个平台的 key。配置目录里没有、钥匙串里有（旧版本存的 Fish Audio key），就搬过来并删掉钥匙串里那条，
 /// 以后启动不再访问钥匙串（未签名的 app 每次重新编译后访问钥匙串都会弹窗）。
 /// `from_keychain` 为 false 时不碰钥匙串（测试模式的配置目录是临时目录）。
-fn load_key(path: &std::path::Path, from_keychain: bool) -> Option<(String, &'static str)> {
+fn load_key(dir: &Path, p: &Provider, from_keychain: bool) -> Option<(String, &'static str)> {
+    let path = &key_path(dir, p.id);
+    let from_keychain = from_keychain && p.id == LEGACY_KEYCHAIN_PROVIDER;
     if let Ok(k) = std::fs::read_to_string(path) {
         let k = k.trim();
         if !k.is_empty() {
@@ -194,13 +258,28 @@ fn load_key(path: &std::path::Path, from_keychain: bool) -> Option<(String, &'st
             return Some((k, "saved"));
         }
     }
-    env_key()
+    env_key(p)
 }
 
-fn net(s: &AppState) -> Result<Net, String> {
-    let key = s.key.lock().unwrap().as_ref().map(|(k, _)| k.clone()).ok_or("请先填写 Fish Audio API key")?;
+fn creds(s: &AppState, p: &Provider) -> Result<Creds, String> {
+    let key = s.keys.lock().unwrap().get(p.id).map(|(k, _)| k.clone()).ok_or_else(|| format!("请先填写 {} API key", p.name))?;
     let proxy = s.settings.lock().unwrap().proxy.clone();
-    Net::new(&key, &proxy).map_err(|e| format!("{e:#}"))
+    let http = HttpKit::new(&proxy).map_err(|e| format!("{e:#}"))?;
+    Ok(Creds { key, http })
+}
+
+/// 按当前设置建朗读后端。
+fn build_tts(s: &AppState) -> Result<Arc<dyn Tts>, String> {
+    let p = s.settings.lock().unwrap().tts_provider();
+    let spec = p.tts.as_ref().expect("朗读平台");
+    (spec.build)(&creds(s, p)?).map_err(|e| format!("{e:#}"))
+}
+
+/// 按当前设置建转写后端。
+fn build_stt(s: &AppState) -> Result<Arc<dyn Stt>, String> {
+    let p = s.settings.lock().unwrap().stt_provider();
+    let spec = p.stt.as_ref().expect("转写平台");
+    (spec.build)(&creds(s, p)?).map_err(|e| format!("{e:#}"))
 }
 
 fn save_file(s: &AppState) -> Result<(), String> {
@@ -250,7 +329,7 @@ fn register_hotkey(app: &AppHandle) {
 
 fn start_pipeline(app: &AppHandle) -> Result<(), String> {
     let s = app.state::<AppState>();
-    let net = net(&s)?;
+    let (tts, stt) = (build_tts(&s)?, build_stt(&s)?);
     let cfg = {
         let st = s.settings.lock().unwrap();
         Config {
@@ -272,7 +351,7 @@ fn start_pipeline(app: &AppHandle) -> Result<(), String> {
     };
     let defaults = (audio::default_id(true), audio::default_id(false));
     let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
-    let pipeline = Pipeline::start(net, cfg, s.held.clone(), tx).map_err(|e| format!("{e:#}"))?;
+    let pipeline = Pipeline::start(tts, stt, cfg, s.held.clone(), tx).map_err(|e| format!("{e:#}"))?;
     let run = s.run.fetch_add(1, Ordering::AcqRel) + 1;
     s.device_lost.store(false, Ordering::Release);
     *s.defaults.lock().unwrap() = defaults;
@@ -377,7 +456,7 @@ async fn save_settings(app: AppHandle, settings: Settings) -> Result<Snapshot, S
     }
     let running = s.pipeline.lock().unwrap().is_some();
     if running {
-        if old.audio_part() != settings.audio_part() {
+        if old.restart_part() != settings.restart_part() {
             stop_pipeline(&s);
             start_pipeline(&app)?;
         } else if let Some(p) = s.pipeline.lock().unwrap().as_ref() {
@@ -392,25 +471,35 @@ async fn save_settings(app: AppHandle, settings: Settings) -> Result<Snapshot, S
     Ok(snapshot_of(&s))
 }
 
+fn provider(id: &str) -> Result<&'static Provider, String> {
+    backend::find(id).ok_or_else(|| format!("没有平台 {id}"))
+}
+
 #[tauri::command]
-fn set_api_key(state: State<'_, AppState>, key: String) -> Result<(), String> {
+fn set_api_key(state: State<'_, AppState>, provider: String, key: String) -> Result<(), String> {
+    let p = self::provider(&provider)?;
     let key = key.trim();
     if key.is_empty() {
         return Err("key 为空".into());
     }
-    write_key(&state.key_path, key).map_err(|e| format!("保存 key 失败：{e}"))?;
-    *state.key.lock().unwrap() = Some((key.to_string(), "saved"));
+    write_key(&key_path(&state.key_dir, p.id), key).map_err(|e| format!("保存 key 失败：{e}"))?;
+    state.keys.lock().unwrap().insert(p.id, (key.to_string(), "saved"));
     Ok(())
 }
 
 #[tauri::command]
-fn clear_api_key(state: State<'_, AppState>) -> Result<(), String> {
-    match std::fs::remove_file(&state.key_path) {
+fn clear_api_key(state: State<'_, AppState>, provider: String) -> Result<(), String> {
+    let p = self::provider(&provider)?;
+    match std::fs::remove_file(key_path(&state.key_dir, p.id)) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("清除 key 失败：{e}")),
     }
-    *state.key.lock().unwrap() = env_key();
+    let mut keys = state.keys.lock().unwrap();
+    match env_key(p) {
+        Some(k) => keys.insert(p.id, k),
+        None => keys.remove(p.id),
+    };
     Ok(())
 }
 
@@ -455,23 +544,23 @@ fn stop_speech(state: State<'_, AppState>) {
     }
 }
 
-/// 账号里自己的声音。
+/// 当前朗读平台上，账号里自己的声音。
 #[tauri::command]
-async fn own_voices(app: AppHandle) -> Result<Vec<OwnVoice>, String> {
-    let net = net(&app.state::<AppState>())?;
-    voices::own_voices(&net).await.map_err(|e| format!("{e:#}"))
+async fn account_voices(app: AppHandle) -> Result<Vec<Voice>, String> {
+    let tts = build_tts(&app.state::<AppState>())?;
+    tts.account_voices().await.map_err(|e| format!("{e:#}"))
 }
 
 /// 试听：用选中的声音读一句，放到监听设备；没选监听设备时放到系统默认输出。
 #[tauri::command]
 async fn preview(app: AppHandle, voice: VoiceConfig) -> Result<(), String> {
     let s = app.state::<AppState>();
-    let net = net(&s)?;
+    let tts = build_tts(&s)?;
     let (device, volume) = {
         let st = s.settings.lock().unwrap();
         (st.monitor.clone(), if st.monitor.is_empty() { 1.0 } else { st.monitor_volume })
     };
-    queue::preview(&net, &voice, &device, volume, PREVIEW_TEXT).await.map_err(|e| format!("{e:#}"))
+    queue::preview(&tts, &voice, &device, volume, PREVIEW_TEXT).await.map_err(|e| format!("{e:#}"))
 }
 
 async fn start_overlay(app: &AppHandle) {
@@ -492,15 +581,37 @@ async fn start_overlay(app: &AppHandle) {
     }
 }
 
-/// 旧版本存的是 Gemini 的模型和声音名，换成现在的默认值。
-fn migrate(mut s: Settings) -> Settings {
-    let d = Settings::default();
-    if !tts::MODELS.contains(&s.model.as_str()) {
-        s.model = d.model;
+/// 读设置前改原始 JSON：旧版本只有 Fish Audio 一个平台，顶层的 model / voice 就是 Fish 的选择，
+/// 搬到 voices["fish"]。更早的版本存的是 Gemini 的模型和声音名，换成 Fish 的默认值。
+fn migrate_legacy(v: &mut serde_json::Value) {
+    let Some(obj) = v.as_object_mut() else { return };
+    let (model, voice) = (obj.remove("model"), obj.remove("voice"));
+    if obj.contains_key("voices") || (model.is_none() && voice.is_none()) {
+        return;
     }
-    // Fish 的声音 id 是 32 位十六进制；不是的话是旧版本的 Gemini 声音名
-    if !(s.voice.len() == 32 && s.voice.chars().all(|c| c.is_ascii_hexdigit())) {
-        s.voice = d.voice;
+    let fish = backend::fish::PROVIDER;
+    let (spec, d) = (fish.tts.as_ref().expect("Fish 能朗读"), fish.default_voice().expect("Fish 有默认声音"));
+    let model = model.and_then(|m| m.as_str().map(str::to_string)).filter(|m| spec.models.contains(&m.as_str()));
+    // Fish 的声音 id 是 32 位十六进制；不是的话是 Gemini 的声音名
+    let voice = voice
+        .and_then(|v| v.as_str().map(str::to_string))
+        .filter(|v| v.len() == 32 && v.chars().all(|c| c.is_ascii_hexdigit()));
+    let cfg = VoiceConfig { model: model.unwrap_or(d.model), voice: voice.unwrap_or(d.voice) };
+    let mut voices = serde_json::Map::new();
+    voices.insert(fish.id.into(), serde_json::to_value(cfg).expect("VoiceConfig 能序列化"));
+    obj.insert("voices".into(), voices.into());
+}
+
+/// 读出来的设置里，平台已经不存在、或模型不在平台列表里的，换成默认值。
+fn migrate(mut s: Settings) -> Settings {
+    s.tts_provider = s.tts_provider().id.into();
+    s.stt_provider = s.stt_provider().id.into();
+    s.voices.retain(|id, _| backend::find(id).is_some_and(|p| p.tts.is_some()));
+    for (id, v) in s.voices.iter_mut() {
+        let p = backend::find(id).expect("上面已过滤");
+        if !p.tts.as_ref().is_some_and(|t| t.models.contains(&v.model.as_str())) {
+            v.model = p.default_voice().expect("朗读平台有默认声音").model;
+        }
     }
     s
 }
@@ -545,11 +656,18 @@ fn main() {
             };
             let settings = std::fs::read_to_string(&path)
                 .ok()
-                .and_then(|t| serde_json::from_str::<Settings>(&t).ok())
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                .and_then(|mut v| {
+                    migrate_legacy(&mut v);
+                    serde_json::from_value::<Settings>(v).ok()
+                })
                 .unwrap_or_else(first_run_settings);
             let settings = migrate(settings);
-            let key_path = path.with_file_name(KEY_FILE);
-            let key = load_key(&key_path, test.is_none());
+            let key_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+            let keys = backend::PROVIDERS
+                .iter()
+                .filter_map(|p| Some((p.id, load_key(&key_dir, p, test.is_none())?)))
+                .collect();
             app.manage(AppState {
                 path,
                 settings: Mutex::new(settings),
@@ -560,8 +678,8 @@ fn main() {
                 waiting: Mutex::new(None),
                 run: AtomicU64::new(0),
                 held: Arc::new(AtomicBool::new(false)),
-                key_path,
-                key: Mutex::new(key),
+                key_dir,
+                keys: Mutex::new(keys),
                 overlay: Mutex::new(None),
                 overlay_error: Mutex::new(None),
                 hotkey: Mutex::new(None),
@@ -597,7 +715,7 @@ fn main() {
             say,
             stop_speech,
             preview,
-            own_voices
+            account_voices
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
@@ -606,4 +724,50 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("启动失败");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn load(json: serde_json::Value) -> Settings {
+        let mut v = json;
+        migrate_legacy(&mut v);
+        migrate(serde_json::from_value(v).unwrap())
+    }
+
+    #[test]
+    fn old_fish_settings_keep_model_and_voice() {
+        let s = load(serde_json::json!({ "mode": "auto", "model": "s2.1-pro", "voice": "bf6c479f5a384b8d857310030035824b" }));
+        assert_eq!(s.tts_provider, "fish");
+        assert_eq!(s.stt_provider, "fish");
+        assert_eq!(s.voice_config(), VoiceConfig { model: "s2.1-pro".into(), voice: "bf6c479f5a384b8d857310030035824b".into() });
+    }
+
+    #[test]
+    fn gemini_settings_fall_back_to_fish_defaults() {
+        let s = load(serde_json::json!({ "model": "gemini-2.5-flash-tts", "voice": "Kore" }));
+        assert_eq!(s.voice_config(), backend::fish::PROVIDER.default_voice().unwrap());
+    }
+
+    #[test]
+    fn new_settings_round_trip() {
+        let mut s = Settings::default();
+        s.voices.insert("fish".into(), VoiceConfig { model: "drama-3".into(), voice: "x".repeat(32) });
+        let s2 = load(serde_json::to_value(&s).unwrap());
+        assert_eq!(s2, s);
+    }
+
+    #[test]
+    fn unknown_provider_and_model_fall_back() {
+        let s = load(serde_json::json!({
+            "tts_provider": "gone", "stt_provider": "gone",
+            "voices": { "gone": { "model": "m", "voice": "v" }, "fish": { "model": "nope", "voice": "v" } }
+        }));
+        assert_eq!(s.tts_provider, "fish");
+        assert_eq!(s.stt_provider, "fish");
+        assert!(!s.voices.contains_key("gone"));
+        assert_eq!(s.voice_config().model, "s2.1-pro-free");
+        assert_eq!(s.voice_config().voice, "v");
+    }
 }

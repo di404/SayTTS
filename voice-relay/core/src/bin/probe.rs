@@ -1,15 +1,16 @@
-//! 不开界面、不出声地测试云端链路。key 读环境变量 FISH_API_KEY；代理默认用系统代理。
+//! 不开界面、不出声地测试云端链路。key 读平台的环境变量（Fish Audio 是 FISH_API_KEY）；代理默认用系统代理。
 //!
 //!   probe tts  [--model M] [--voice V] [--runs N] [--gap 秒] [--text T] [--out DIR]
 //!   probe stt  --wav F [--repeat N] [--gap 秒]
 //!   probe voices
 //!   probe devices [--open 1]
 //!   probe e2e  --wav F [--repeat N] [--gap 秒] [--model M] [--voice V]
-//!   (公共) [--proxy URL]
+//!   (公共) [--provider fish] [--proxy URL]
 
 use std::{
     collections::HashMap,
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -19,10 +20,11 @@ use voice_core::{
     audio,
     endpointer::{Endpointer, FRAME, Mode},
     pipeline::{Config, Event, Input, Pipeline, Sink},
+    backend::{self, Creds, Provider},
+    net::HttpKit,
     queue::VoiceConfig,
-    net::Net,
-    stt::{Gate, STT_RATE, SttEvent, Transcriber},
-    tts::{self, TTS_RATE},
+    stt::{Gate, STT_RATE, Stt, SttEvent, Transcriber},
+    tts::{self, Tts, TtsRequest},
     wav,
 };
 
@@ -51,14 +53,20 @@ impl Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let key = std::env::var("FISH_API_KEY").context("需要环境变量 FISH_API_KEY")?;
-    let net = Net::new(&key, &args.get("proxy", ""))?;
+    let id = args.get("provider", backend::PROVIDERS[0].id);
+    let p = backend::find(&id).with_context(|| format!("没有平台 {id}"))?;
+    let creds = || -> Result<Creds> {
+        let key = std::env::var(p.key_env).with_context(|| format!("需要环境变量 {}", p.key_env))?;
+        Ok(Creds { key, http: HttpKit::new(&args.get("proxy", ""))? })
+    };
+    let tts = || -> Result<Arc<dyn Tts>> { (p.tts.as_ref().context("这个平台不能朗读")?.build)(&creds()?) };
+    let stt = || -> Result<Arc<dyn Stt>> { (p.stt.as_ref().context("这个平台不能转写")?.build)(&creds()?) };
     match args.cmd.as_str() {
-        "tts" => tts_cmd(&net, &args).await,
-        "stt" => stt_cmd(&net, &args).await,
-        "voices" => voices_cmd(&net).await,
+        "tts" => tts_cmd(&tts()?, p, &args).await,
+        "stt" => stt_cmd(stt()?.as_ref(), &args).await,
+        "voices" => voices_cmd(&tts()?, p).await,
         "devices" => devices_cmd(&args),
-        "e2e" => e2e_cmd(&net, &args).await,
+        "e2e" => e2e_cmd(tts()?, stt()?, p, &args).await,
         _ => {
             eprintln!("用法：probe tts|stt|voices [选项]");
             Ok(())
@@ -66,9 +74,11 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn tts_cmd(net: &Net, args: &Args) -> Result<()> {
-    let model = args.get("model", tts::MODELS[0]);
-    let voice = args.get("voice", voice_core::voices::VOICES[0].id);
+async fn tts_cmd(engine: &Arc<dyn Tts>, p: &Provider, args: &Args) -> Result<()> {
+    let d = p.default_voice().context("这个平台不能朗读")?;
+    let model = args.get("model", &d.model);
+    let voice = args.get("voice", &d.voice);
+    let rate = engine.rate();
     let text = args.get("text", "今天我们来玩一下这个新出的解谜游戏，看看能不能一次通关。");
     let runs: usize = args.get("runs", "3").parse()?;
     let gap: f64 = args.get("gap", "0").parse()?;
@@ -85,14 +95,15 @@ async fn tts_cmd(net: &Net, args: &Args) -> Result<()> {
         let mut pcm: Vec<i16> = Vec::new();
         let mut chunks: Vec<(Duration, usize)> = Vec::new(); // 每块到达的时刻、它在整句里的起点
         let mut keep = 0; // app 从这个采样开始播：第一个有声采样前留 10 ms
-        let synth = tts::synthesize(net, &model, &voice, &text, |chunk| {
+        let req = TtsRequest { model: model.clone(), voice: voice.clone(), text: text.clone() };
+        let synth = tts::synthesize(engine, &req, |chunk| {
             first.get_or_insert(t0.elapsed());
             chunks.push((t0.elapsed(), pcm.len()));
             if sound.is_none()
                 && let Some(i) = chunk.iter().position(|v| v.unsigned_abs() > 300)
             {
                 // 第一个有声采样在音频里的位置也算进去：它要等前面的静音播完才出声
-                let lead = Duration::from_secs_f64((pcm.len() + i) as f64 / TTS_RATE as f64);
+                let lead = Duration::from_secs_f64((pcm.len() + i) as f64 / rate as f64);
                 sound = Some((t0.elapsed(), lead));
                 keep = pcm.len() + i.saturating_sub(240);
             }
@@ -106,7 +117,7 @@ async fn tts_cmd(net: &Net, args: &Args) -> Result<()> {
             }
         }
         let total = t0.elapsed();
-        let audio = pcm.len() as f64 / TTS_RATE as f64;
+        let audio = pcm.len() as f64 / rate as f64;
         let (st, lead) = sound.unwrap_or_default();
         println!(
             "#{run} {model} {voice}: 首块 {} ms，首个有声采样到达 {} ms（音频内静音 {} ms），合成完 {} ms，音频 {:.2} s，首块之后 {:.1}× 实时",
@@ -123,7 +134,7 @@ async fn tts_cmd(net: &Net, args: &Args) -> Result<()> {
         let need = chunks
             .iter()
             .filter(|(_, p)| *p > keep)
-            .map(|(a, p)| (*a - st).as_secs_f64() - (p - keep) as f64 / TTS_RATE as f64)
+            .map(|(a, p)| (*a - st).as_secs_f64() - (p - keep) as f64 / rate as f64)
             .fold(0.0, f64::max);
         let tail = total - chunks.last().map_or(total, |c| c.0);
         println!(
@@ -136,7 +147,7 @@ async fn tts_cmd(net: &Net, args: &Args) -> Result<()> {
         sounds.push(ms(st));
         if run + 1 == runs {
             let path = out.join(format!("{model}-{voice}.wav"));
-            wav::write_mono(&path, &pcm, TTS_RATE)?;
+            wav::write_mono(&path, &pcm, rate)?;
             println!("样本：{}", path.display());
         }
     }
@@ -144,14 +155,14 @@ async fn tts_cmd(net: &Net, args: &Args) -> Result<()> {
     Ok(())
 }
 
-async fn stt_cmd(net: &Net, args: &Args) -> Result<()> {
+async fn stt_cmd(engine: &dyn Stt, args: &Args) -> Result<()> {
     let path = PathBuf::from(args.get("wav", ""));
     let pcm = wav::read_mono(&path, STT_RATE).with_context(|| format!("读不了 {}", path.display()))?;
     let repeat: usize = args.get("repeat", "1").parse()?;
     let gap: f64 = args.get("gap", "2").parse()?;
     let (etx, mut erx) = mpsc::unbounded_channel();
     let t0 = Instant::now();
-    let tr = Transcriber::start(net.clone(), vocab(args), etx);
+    let tr = Transcriber::start(engine, vocab(args), etx);
 
     // 先等连接好，记下建连时间
     match tokio::time::timeout(Duration::from_secs(20), erx.recv()).await {
@@ -242,12 +253,15 @@ async fn stt_cmd(net: &Net, args: &Args) -> Result<()> {
     Ok(())
 }
 
-async fn voices_cmd(net: &Net) -> Result<()> {
+async fn voices_cmd(engine: &Arc<dyn Tts>, p: &Provider) -> Result<()> {
+    let spec = p.tts.as_ref().context("这个平台不能朗读")?;
+    let ids: Vec<&str> = spec.voices.iter().map(|v| v.id).collect();
     let mut ok = Vec::new();
     let mut bad = Vec::new();
-    for chunk in voice_core_voices().chunks(6) {
+    for chunk in ids.chunks(6) {
         let rs = futures_util::future::join_all(chunk.iter().map(|v| async move {
-            (v, tts::synthesize(net, tts::MODELS[0], v, "好的。", |_| {}).await)
+            let req = TtsRequest { model: spec.models[0].to_string(), voice: v.to_string(), text: "好的。".into() };
+            (v, tts::synthesize(engine, &req, |_| {}).await)
         }))
         .await;
         for (v, r) in rs {
@@ -276,7 +290,8 @@ fn devices_cmd(args: &Args) -> Result<()> {
         let outs = audio::outputs()?;
         let pick = outs.iter().find(|d| d.name.contains("BlackHole")).or_else(|| outs.iter().find(|d| d.default));
         if let Some(d) = pick {
-            let o = audio::Output::open(&d.id, |e| eprintln!("{}", e.message))?;
+            // 不送音频，源采样率填多少都一样
+            let o = audio::Output::open(&d.id, 24000, |e| eprintln!("{}", e.message))?;
             std::thread::sleep(Duration::from_millis(500));
             println!("已打开输出“{}”，{} Hz，0.5 秒内播出静音 {} 个采样", o.name, o.rate, o.played());
         }
@@ -284,7 +299,7 @@ fn devices_cmd(args: &Args) -> Result<()> {
     Ok(())
 }
 
-async fn e2e_cmd(net: &Net, args: &Args) -> Result<()> {
+async fn e2e_cmd(engine: Arc<dyn Tts>, stt: Arc<dyn Stt>, p: &Provider, args: &Args) -> Result<()> {
     let wav_in = PathBuf::from(args.get("wav", ""));
     let repeat: usize = args.get("repeat", "1").parse()?;
     let gap: f64 = args.get("gap", "3").parse()?;
@@ -308,14 +323,17 @@ async fn e2e_cmd(net: &Net, args: &Args) -> Result<()> {
         mode: Mode::Auto,
         gate_ms,
         max_ms: 0,
-        voice: VoiceConfig { model: args.get("model", tts::MODELS[0]), voice: args.get("voice", voice_core::voices::VOICES[0].id) },
+        voice: {
+            let d = p.default_voice().context("这个平台不能朗读")?;
+            VoiceConfig { model: args.get("model", &d.model), voice: args.get("voice", &d.voice) }
+        },
         vocabulary: vocab(args),
         monitor_volume: 1.0,
         echo_gate: false,
     };
     let (tx, mut rx) = mpsc::unbounded_channel();
     let t0 = Instant::now();
-    let p = Pipeline::start(net.clone(), cfg, Default::default(), tx)?;
+    let pipeline = Pipeline::start(engine, stt, cfg, Default::default(), tx)?;
     let mut ends = Vec::new();
     let mut finals = Vec::new();
     let mut plays = Vec::new();
@@ -339,7 +357,7 @@ async fn e2e_cmd(net: &Net, args: &Args) -> Result<()> {
         }
         println!("[{at:6} ms] {}", serde_json::to_string(&ev)?);
     }
-    drop(p);
+    drop(pipeline);
     println!();
     let gate = Duration::from_millis(gate_ms as u64);
     let mut e2e = Vec::new();
@@ -360,10 +378,6 @@ async fn e2e_cmd(net: &Net, args: &Args) -> Result<()> {
         println!("说完到出声：中位数 {} ms（{} 句）", median(&mut e2e), e2e.len());
     }
     Ok(())
-}
-
-fn voice_core_voices() -> Vec<&'static str> {
-    voice_core::voices::VOICES.iter().map(|v| v.id).collect()
 }
 
 fn ms(d: Duration) -> u128 {

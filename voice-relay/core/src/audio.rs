@@ -21,7 +21,7 @@ use cpal::{
 };
 use serde::Serialize;
 
-use crate::{resample::Resampler, tts::TTS_RATE};
+use crate::resample::Resampler;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DeviceInfo {
@@ -198,6 +198,8 @@ where
 /// 一路播放。音频按设备采样率放进环形队列，声卡回调从里面取；没有数据时输出静音。
 pub struct Output {
     pub rate: u32,
+    /// 送进来的音频是多少 Hz（TTS 后端的输出采样率）
+    src_rate: u32,
     pub name: String,
     ring: Arc<Ring>,
     rs: Resampler,
@@ -246,8 +248,8 @@ enum Sink {
 }
 
 impl Output {
-    /// 打开一个输出设备。`id` 为空时用系统默认输出。
-    pub fn open(id: &str, on_error: impl Fn(StreamError) + Send + 'static) -> Result<Self> {
+    /// 打开一个输出设备。`id` 为空时用系统默认输出。`src_rate` 是之后 `push` 进来的音频的采样率。
+    pub fn open(id: &str, src_rate: u32, on_error: impl Fn(StreamError) + Send + 'static) -> Result<Self> {
         let device = find(false, id)?;
         let name = device.description().map(|d| d.name().to_string()).unwrap_or_default();
         let cfg = device.default_output_config().context("读不到输出设备的格式")?;
@@ -271,29 +273,30 @@ impl Output {
                 f => bail!("不支持的输出格式 {f:?}"),
             })
         })?;
-        Ok(Self { rate, name, ring, rs: Resampler::new(TTS_RATE, rate), written: 0, _sink: Sink::Device(stream) })
+        Ok(Self { rate, src_rate, name, ring, rs: Resampler::new(src_rate, rate), written: 0, _sink: Sink::Device(stream) })
     }
 
     /// 不出声的输出：按实时节奏消费音频并写进 WAV（测试用）。
-    pub fn wav(path: PathBuf, rate: u32) -> Result<Self> {
+    pub fn wav(path: PathBuf, rate: u32, src_rate: u32) -> Result<Self> {
         let ring = Ring::new();
         let sink = WavSink::start(path.clone(), rate, ring.clone())?;
         Ok(Self {
             rate,
+            src_rate,
             name: path.display().to_string(),
             ring,
-            rs: Resampler::new(TTS_RATE, rate),
+            rs: Resampler::new(src_rate, rate),
             written: 0,
             _sink: Sink::Wav(sink),
         })
     }
 
-    /// 送入 24 kHz 的 TTS 音频。
+    /// 送入 `src_rate` Hz 的 TTS 音频。
     pub fn push(&mut self, pcm: &[i16]) {
         // TTS 峰值接近满幅，插值后采样之间的峰会超过 1.0 而削波；留 1 dB 余量。
         const HEADROOM: f32 = 0.89;
         let input: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0 * HEADROOM).collect();
-        let mut out = Vec::with_capacity(input.len() * self.rate as usize / TTS_RATE as usize + 8);
+        let mut out = Vec::with_capacity(input.len() * self.rate as usize / self.src_rate as usize + 8);
         self.rs.process(&input, &mut out);
         self.written += out.len() as u64;
         self.ring.buf.lock().unwrap().extend(out);

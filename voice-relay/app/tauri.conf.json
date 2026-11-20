@@ -17,7 +17,10 @@
         "minWidth": 400,
         "minHeight": 560,
         "visible": false,
-        "backgroundThrottling": "throttle"
+        "backgroundThrottling": "throttle",
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": { "x": 16, "y": 25 }
       }
     ],
     "security": {

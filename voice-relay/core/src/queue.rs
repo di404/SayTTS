@@ -10,13 +10,16 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc};
 
-use crate::{audio::Output, net::Net, tts};
+use crate::{
+    audio::Output,
+    tts::{self, Tts, TtsRequest},
+};
 
 const LEAD_THRESHOLD: u16 = 300; // 开头静音：|采样| 不超过这个值
 const LEAD_KEEP: usize = 240; // 保留第一个有声采样前 10 ms
-/// 一句先攒这么多有声音频（或整句合成完）才开始播。经代理实测，平均合成速度是实时的 4 倍以上，
+/// 一句先攒这么多毫秒的有声音频（或整句合成完）才开始播。经代理实测，平均合成速度是实时的 4 倍以上，
 /// 但首块之后有时停 0.2–0.5 秒才来下一块；从首块就开始播，句子中间会断。先攒够再播，停顿落在开口之前。
-const START_BUFFER: usize = tts::TTS_RATE as usize * 3 / 10;
+const START_BUFFER_MS: u32 = 300;
 const TTS_TIMEOUT: Duration = Duration::from_secs(30);
 const WARM_AFTER: Duration = Duration::from_secs(20); // 空闲这么久后，开口时先预热连接
 
@@ -50,8 +53,9 @@ enum Cmd {
 }
 
 impl SpeechQueue {
+    /// `live` 和 `monitor` 要按 `tts.rate()` 打开。
     pub fn start(
-        net: Net,
+        tts: Arc<dyn Tts>,
         voice: VoiceConfig,
         live: Output,
         monitor: Option<Output>,
@@ -59,7 +63,8 @@ impl SpeechQueue {
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = Actor {
-            net,
+            start_buffer: start_buffer(tts.as_ref()),
+            tts,
             voice,
             live,
             monitor,
@@ -115,7 +120,9 @@ struct Item {
 }
 
 struct Actor {
-    net: Net,
+    tts: Arc<dyn Tts>,
+    /// 一句攒够这么多个采样才开始播
+    start_buffer: usize,
     voice: VoiceConfig,
     live: Output,
     monitor: Option<Output>,
@@ -152,8 +159,7 @@ impl Actor {
             Cmd::Warm => {
                 if self.last_request.is_none_or(|t| t.elapsed() > WARM_AFTER) {
                     self.last_request = Some(Instant::now());
-                    let net = self.net.clone();
-                    tokio::spawn(async move { tts::warm(&net).await });
+                    tokio::spawn(self.tts.warm());
                 }
             }
         }
@@ -164,11 +170,12 @@ impl Actor {
         let id = self.ids;
         self.last_request = Some(Instant::now());
         let audio = Arc::new(Audio { chunks: Mutex::new((Vec::new(), State::Running)) });
-        let (a, wake, net, v, t) = (audio.clone(), self.wake.clone(), self.net.clone(), self.voice.clone(), text.clone());
+        let (a, wake, engine) = (audio.clone(), self.wake.clone(), self.tts.clone());
+        let req = TtsRequest { model: self.voice.model.clone(), voice: self.voice.voice.clone(), text: text.clone() };
         let task = tokio::spawn(async move {
             let r = tokio::time::timeout(
                 TTS_TIMEOUT,
-                tts::synthesize(&net, &v.model, &v.voice, &t, |c| {
+                tts::synthesize(&engine, &req, |c| {
                     a.chunks.lock().unwrap().0.push(c);
                     wake.notify_one();
                 }),
@@ -199,7 +206,7 @@ impl Actor {
                     State::Done => Some(None),
                     State::Failed(e) => Some(Some(e.clone())),
                 };
-                if it.start.is_none() && state.is_none() && voiced_len(&g.0) < START_BUFFER {
+                if it.start.is_none() && state.is_none() && voiced_len(&g.0) < self.start_buffer {
                     break; // 这句还没攒够
                 }
                 (g.0[it.fed..].to_vec(), state)
@@ -283,6 +290,10 @@ impl Actor {
     }
 }
 
+fn start_buffer(tts: &dyn Tts) -> usize {
+    (tts.rate() * START_BUFFER_MS / 1000) as usize
+}
+
 /// 去掉开头静音后（规则和 `push` 一样）有多少个采样。
 fn voiced_len(chunks: &[Vec<i16>]) -> usize {
     for (j, c) in chunks.iter().enumerate() {
@@ -294,18 +305,20 @@ fn voiced_len(chunks: &[Vec<i16>]) -> usize {
 }
 
 /// 试听：用给定的声音读一句，放到 `device`（空字符串是系统默认输出），播完才返回。
-pub async fn preview(net: &Net, v: &VoiceConfig, device: &str, volume: f32, text: &str) -> anyhow::Result<()> {
-    let mut out = Output::open(device, |_| {})?;
+pub async fn preview(tts: &Arc<dyn Tts>, v: &VoiceConfig, device: &str, volume: f32, text: &str) -> anyhow::Result<()> {
+    let mut out = Output::open(device, tts.rate(), |_| {})?;
+    let need = start_buffer(tts.as_ref());
+    let req = TtsRequest { model: v.model.clone(), voice: v.voice.clone(), text: text.to_string() };
     out.volume().set(volume);
     let mut held: Vec<Vec<i16>> = Vec::new(); // 和朗读队列一样，攒够再开始播
     let mut started = false;
-    let synth = tts::synthesize(net, &v.model, &v.voice, text, |c| {
+    let synth = tts::synthesize(tts, &req, |c| {
         if started {
             out.push(&c);
             return;
         }
         held.push(c);
-        if voiced_len(&held) >= START_BUFFER {
+        if voiced_len(&held) >= need {
             started = true;
             held.drain(..).for_each(|h| out.push(&h));
         }

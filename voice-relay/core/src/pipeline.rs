@@ -18,10 +18,10 @@ use tokio::sync::mpsc;
 use crate::{
     audio::{self, Capture, Output, Volume},
     endpointer::{Endpointer, FRAME, Mode},
-    net::Net,
     queue::{QueueEvent, SpeechQueue, VoiceConfig},
     resample::Resampler,
-    stt::{Gate, STT_RATE, SttEvent, Transcriber},
+    stt::{Gate, STT_RATE, Stt, SttEvent, Transcriber},
+    tts::Tts,
     wav,
 };
 
@@ -92,15 +92,21 @@ pub struct Pipeline {
 
 impl Pipeline {
     /// 需要在 tokio 运行时里调用。`held` 是按键说话的按键状态。
-    pub fn start(net: Net, cfg: Config, held: Arc<AtomicBool>, events: mpsc::UnboundedSender<Event>) -> Result<Self> {
+    pub fn start(
+        tts: Arc<dyn Tts>,
+        stt: Arc<dyn Stt>,
+        cfg: Config,
+        held: Arc<AtomicBool>,
+        events: mpsc::UnboundedSender<Event>,
+    ) -> Result<Self> {
         let err_tx = events.clone();
         let on_error = move |e: audio::StreamError| {
             let _ = err_tx.send(if e.lost { Event::DeviceLost { message: e.message } } else { Event::Error { message: e.message } });
         };
         let open = |s: &Sink| -> Result<Output> {
             match s {
-                Sink::Device(id) => Output::open(id, on_error.clone()),
-                Sink::Wav(p) => Output::wav(p.clone(), 48000),
+                Sink::Device(id) => Output::open(id, tts.rate(), on_error.clone()),
+                Sink::Wav(p) => Output::wav(p.clone(), 48000, tts.rate()),
             }
         };
         let live = open(&cfg.output)?;
@@ -161,7 +167,7 @@ impl Pipeline {
 
         // 朗读队列
         let (qtx, mut qrx) = mpsc::unbounded_channel();
-        let queue = SpeechQueue::start(net.clone(), cfg.voice.clone(), live, monitor, qtx);
+        let queue = SpeechQueue::start(tts.clone(), cfg.voice.clone(), live, monitor, qtx);
         let ev = events.clone();
         tokio::spawn(async move {
             while let Some(e) = qrx.recv().await {
@@ -177,7 +183,7 @@ impl Pipeline {
 
         // 转写：定稿直接进朗读队列
         let (stx, mut srx) = mpsc::unbounded_channel();
-        let transcriber = Transcriber::start(net, cfg.vocabulary.clone(), stx);
+        let transcriber = Transcriber::start(stt.as_ref(), cfg.vocabulary.clone(), stx);
         let (ev, q) = (events.clone(), queue.clone());
         tokio::spawn(async move {
             while let Some(e) = srx.recv().await {

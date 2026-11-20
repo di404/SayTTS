@@ -96,10 +96,10 @@ async fn client(mut socket: WebSocket, o: Overlay) {
     let mut stop = o.stop.subscribe();
     // 新打开的页面先显示当前这句
     let now = o.current.lock().unwrap().clone();
-    if let Some((id, text)) = now {
-        if send(&mut socket, &OverlayEvent::Show { id, text }).await.is_err() {
-            return;
-        }
+    if let Some((id, text)) = now
+        && send(&mut socket, &OverlayEvent::Show { id, text }).await.is_err()
+    {
+        return;
     }
     loop {
         tokio::select! {
