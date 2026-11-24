@@ -79,6 +79,7 @@ impl From<anyhow::Error> for SpeechError {
 /// 合成一句话。每收到一块音频调用一次 `on_audio`（`tts.rate()` Hz 单声道 i16），音频只来自一个请求。
 /// 返回时整句已合成完。调用方 drop 这个 future 就会中止所有请求。
 pub async fn synthesize(tts: &Arc<dyn Tts>, req: &TtsRequest, mut on_audio: impl FnMut(Vec<i16>)) -> Result<()> {
+    let req = &TtsRequest { text: spell_digits(&req.text), ..req.clone() };
     enum Msg {
         Audio(usize, Vec<i16>),
         End(usize, Result<(), SpeechError>),
@@ -179,5 +180,53 @@ impl Drop for Attempts {
         for t in &self.0 {
             t.abort();
         }
+    }
+}
+
+/// 连续这么多个阿拉伯数字以上，就逐个数字念。
+const SPELL_MIN_DIGITS: usize = 3;
+
+/// 转写常把“一二三”写成 `123`，而朗读服务会把它当成一个数念成“一百二十三”。
+/// 所以发给朗读之前，把连续的长数字串换成逐位的汉字（`123` → `一二三`）。
+/// 短的（`30`、`5`）保持原样，让服务按平常的数念；界面上显示的文字不受影响。
+pub fn spell_digits(text: &str) -> String {
+    const ZH: [char; 10] = ['零', '一', '二', '三', '四', '五', '六', '七', '八', '九'];
+    let mut out = String::with_capacity(text.len());
+    let mut run = String::new();
+    let flush = |run: &mut String, out: &mut String| {
+        if run.chars().count() >= SPELL_MIN_DIGITS {
+            out.extend(run.chars().map(|c| ZH[c.to_digit(10).unwrap() as usize]));
+        } else {
+            out.push_str(run);
+        }
+        run.clear();
+    };
+    for c in text.chars() {
+        if c.is_ascii_digit() {
+            run.push(c);
+        } else {
+            flush(&mut run, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut run, &mut out);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::spell_digits;
+
+    #[test]
+    fn long_digit_runs_are_spelled() {
+        assert_eq!(spell_digits("123"), "一二三");
+        assert_eq!(spell_digits("房间 2024 号"), "房间 二零二四 号");
+        assert_eq!(spell_digits("我是1001"), "我是一零零一");
+    }
+
+    #[test]
+    fn short_numbers_are_kept() {
+        assert_eq!(spell_digits("我有 5 个，30 分钟"), "我有 5 个，30 分钟");
+        assert_eq!(spell_digits("没有数字"), "没有数字");
     }
 }
